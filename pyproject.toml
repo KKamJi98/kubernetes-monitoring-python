@@ -6,7 +6,7 @@ authors = [
     { name = "KKamJi", email = "xowl5460@naver.com" }
 ]
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "kubernetes>=32.0.1",
     "tabulate>=0.9.0",
@@ -27,7 +27,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.ruff]
 line-length = 88
-target-version = "py38"
+target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"] # Error, Flake8, Warnings, isort
@@ -37,7 +37,7 @@ ignore = ["E501"] # Line too long, handled by formatter
 line-ending = "lf"
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
