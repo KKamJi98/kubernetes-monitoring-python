@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * Rename '재시작된 컨테이너 확인 및 로그 조회' menu to 'Container Monitoring (재시작된 컨테이너 및 로그)' for consistency.
 
+## [1.4.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.3.0...v1.4.0) (2025-10-03)
+
+
+### Features
+
+* add graceful CLI shutdown handlers ([9f07076](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/9f07076ae112c3e91d72434cd6ef5f813362ffa5))
+* support kubecolor for kubectl commands ([0eabe89](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/0eabe8999ac0bc3396d2982113349ef170af98c6))
+
+
+### Bug Fixes
+
+* add leading blank line before graceful-exit messages ([c62fff4](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/c62fff4ad0832f7a4b5b2bac9aa0a87f0f5d542d))
+* treat Succeeded pods as normal in counts ([4efc9b7](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/4efc9b72764f1beed32da4c31cac8c8fc2868777))
+
+
+### Documentation
+
+* switch formatting to Ruff and update quality rules ([c062fd6](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/c062fd6bd53b4264c11d80ba550017ba60603166))
+* update README for Ruff and dev workflow ([a1aa14a](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/a1aa14a5801948048903cdb88f5a8426a05c1fdc))
+
 ## [1.3.0](https://github.com/KKamJi98/monitoring-kubernetes/compare/v1.2.0...v1.3.0) (2025-07-04)
 
 
