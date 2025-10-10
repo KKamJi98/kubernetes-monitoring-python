@@ -39,10 +39,15 @@ WINDOWS_INPUT_BUFFER: List[str] = []
 POSIX_INPUT_BUFFER: List[str] = []
 CURRENT_INPUT_DISPLAY = ""
 
+LIVE_REFRESH_INTERVAL = 2.0  # seconds
+INPUT_POLL_INTERVAL = 0.05  # seconds
+COMMAND_INPUT_VISIBLE = False
+
 
 def _set_input_display(text: str) -> None:
-    global CURRENT_INPUT_DISPLAY
+    global CURRENT_INPUT_DISPLAY, COMMAND_INPUT_VISIBLE
     CURRENT_INPUT_DISPLAY = text
+    COMMAND_INPUT_VISIBLE = bool(text) and text.startswith(":")
 
 
 def _clear_input_display() -> None:
@@ -168,6 +173,10 @@ def _read_nonblocking_command() -> Optional[str]:
                 _clear_input_display()
                 # Enter 입력 시 CR/LF 잔여 문자를 비움
                 continue
+            if char == "\x1b":
+                WINDOWS_INPUT_BUFFER.clear()
+                _clear_input_display()
+                continue
             if char in ("\b", "\x7f"):
                 if WINDOWS_INPUT_BUFFER:
                     WINDOWS_INPUT_BUFFER.pop()
@@ -205,6 +214,20 @@ def _read_nonblocking_command() -> Optional[str]:
             POSIX_INPUT_BUFFER.clear()
             _clear_input_display()
             break
+        if char == "\x1b":
+            POSIX_INPUT_BUFFER.clear()
+            _clear_input_display()
+            while True:
+                readable, _, _ = select.select([fd], [], [], 0)
+                if not readable:
+                    break
+                try:
+                    leftover = posix_os.read(fd, 1)
+                except OSError:
+                    break
+                if not leftover:
+                    break
+            continue
         if char in ("\x7f", "\b"):
             if POSIX_INPUT_BUFFER:
                 POSIX_INPUT_BUFFER.pop()
@@ -285,13 +308,24 @@ class LiveFrameTracker:
             self.last_frame = None
         if frame_key != self.last_frame:
             self.live.update(renderable)
+            self.live.refresh()
             self.last_frame = frame_key
         if snapshot_markdown is not None:
             self.latest_snapshot = snapshot_markdown
 
-    def tick(self) -> None:
-        _tick_iteration(self.live, self.latest_snapshot)
-        time.sleep(2)
+    def tick(self, interval: float = LIVE_REFRESH_INTERVAL) -> None:
+        deadline = time.monotonic() + interval
+        while True:
+            previous_input = self.last_input_state
+            _tick_iteration(self.live, self.latest_snapshot)
+            current_input = CURRENT_INPUT_DISPLAY
+            if current_input != previous_input:
+                self.last_input_state = current_input
+                self.live.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(INPUT_POLL_INTERVAL, remaining))
 
 
 def _parse_cpu_to_millicores(value: str) -> int:
@@ -365,33 +399,26 @@ def _command_panel(command: str) -> Panel:
     )
 
 
-class _CommandInputRenderable:
-    """현재 입력 버퍼 상태를 실시간으로 렌더링."""
+class _CommandInputPanel:
+    """COMMAND_INPUT_VISIBLE 상태에 따라 패널을 조건부로 출력."""
 
     def __rich_console__(self, console: Console, options):  # type: ignore[override]
+        if not COMMAND_INPUT_VISIBLE:
+            return
         display = CURRENT_INPUT_DISPLAY
-        if display:
-            prompt = display if display.startswith(":") else f":{display}"
-            style = "bold cyan"
-        else:
-            prompt = ":"
-            style = "dim"
-        yield Text(prompt, style=style)
-
-
-def _input_prompt_panel() -> Panel:
-    """현재 명령 입력 상태를 표시하는 패널."""
-    return Panel(
-        _CommandInputRenderable(),
-        title="command input",
-        border_style="cyan",
-    )
+        prompt = display if display else ":"
+        style = "bold cyan" if display else "dim"
+        yield Panel(
+            Text(prompt, style=style),
+            title="command input",
+            border_style="cyan",
+        )
 
 
 def _compose_group(command: str, *renderables: RenderableType) -> Group:
     """메인 콘텐츠와 kubectl 명령을 하단에 배치한 그룹 구성."""
     items: List[RenderableType] = []
-    items.append(_input_prompt_panel())
+    items.append(_CommandInputPanel())
     items.extend(renderables)
     items.append(_command_panel(command))
     return Group(*items)
@@ -738,7 +765,7 @@ def watch_event_monitoring() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -920,7 +947,7 @@ def watch_pod_monitoring_by_creation() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -1027,7 +1054,7 @@ def watch_non_running_pod() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -1125,7 +1152,7 @@ def watch_pod_counts() -> None:
     v1 = client.CoreV1Api()
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     pods = get_pods(v1, ns)
@@ -1221,7 +1248,7 @@ def watch_node_monitoring_by_creation() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -1341,7 +1368,7 @@ def watch_unhealthy_nodes() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -1472,7 +1499,7 @@ def watch_node_resources() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
@@ -1605,7 +1632,7 @@ def watch_pod_resources() -> None:
 
     try:
         with suppress_terminal_echo():
-            with Live(console=console, refresh_per_second=4.0) as live:
+            with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
