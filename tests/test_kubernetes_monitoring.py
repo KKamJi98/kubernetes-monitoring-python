@@ -1,5 +1,6 @@
 import os
 import sys
+from functools import partial
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -152,11 +153,7 @@ def test_save_markdown_snapshot_permission_error(monkeypatch):
     def fail_mkdir(*args, **kwargs):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(
-        kubernetes_monitoring.SNAPSHOT_EXPORT_DIR,
-        "mkdir",
-        fail_mkdir,
-    )
+    monkeypatch.setattr("pathlib.Path.mkdir", fail_mkdir)
 
     with pytest.raises(kubernetes_monitoring.SnapshotSaveError):
         kubernetes_monitoring._save_markdown_snapshot("data")
@@ -165,6 +162,11 @@ def test_save_markdown_snapshot_permission_error(monkeypatch):
 class _DummyLive:
     def __init__(self, console: Console) -> None:
         self.console = console
+
+
+def _helper_fake_save(path: Path, markdown: str) -> Path:
+    path.write_text(markdown)
+    return path
 
 
 def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
@@ -181,17 +183,16 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     success_live = _DummyLive(success_console)
 
     saved_path = tmp_path / "snapshot.md"
-
-    def fake_save(markdown: str) -> Path:
-        saved_path.write_text(markdown)
-        return saved_path
+    fake_save_with_path = partial(_helper_fake_save, saved_path)
 
     monkeypatch.setattr(
-        kubernetes_monitoring, "_save_markdown_snapshot", fake_save, raising=False
+        kubernetes_monitoring,
+        "_save_markdown_snapshot",
+        fake_save_with_path,
+        raising=False,
     )
     kubernetes_monitoring._handle_snapshot_command(success_live, "data", ":save")
     text_output = success_console.export_text()
-    assert (
-        f"입력 ':save' 처리 성공: Slack Markdown 스냅샷 저장 완료 → {saved_path}"
-        in text_output
-    )
+    assert "입력 ':save' 처리 성공" in text_output
+    assert "Slack Markdown 스냅샷 저장 완료" in text_output
+    assert str(saved_path) in text_output

@@ -9,7 +9,19 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    cast,
+)
 
 try:
     from kubernetes import client, config
@@ -43,6 +55,15 @@ LIVE_REFRESH_INTERVAL = 2.0  # seconds
 INPUT_POLL_INTERVAL = 0.05  # seconds
 COMMAND_INPUT_VISIBLE = False
 
+FrameKey = Tuple[str, Tuple[str, ...]]
+
+if TYPE_CHECKING:
+
+    class _MsvcrtModule(Protocol):
+        def kbhit(self) -> bool: ...
+
+        def getwch(self) -> str: ...
+
 
 def _set_input_display(text: str) -> None:
     global CURRENT_INPUT_DISPLAY, COMMAND_INPUT_VISIBLE
@@ -52,6 +73,20 @@ def _set_input_display(text: str) -> None:
 
 def _clear_input_display() -> None:
     _set_input_display("")
+
+
+def _make_frame_key(tag: str, *parts: str) -> FrameKey:
+    return (tag, tuple(parts))
+
+
+class PodUsageRecord(TypedDict):
+    namespace: str
+    pod: str
+    cpu_raw: str
+    cpu_millicores: int
+    memory_raw: str
+    memory_bytes: int
+    node: str
 
 
 class SnapshotSaveError(RuntimeError):
@@ -163,10 +198,11 @@ def _read_nonblocking_command() -> Optional[str]:
             import msvcrt
         except ImportError:
             return None
+        typed_msvcrt = cast("_MsvcrtModule", msvcrt)
 
         command_ready = None
-        while msvcrt.kbhit():
-            char = msvcrt.getwch()
+        while typed_msvcrt.kbhit():
+            char = typed_msvcrt.getwch()
             if char in ("\r", "\n"):
                 command_ready = "".join(WINDOWS_INPUT_BUFFER).strip()
                 WINDOWS_INPUT_BUFFER.clear()
@@ -197,7 +233,7 @@ def _read_nonblocking_command() -> Optional[str]:
     except OSError:
         return None
 
-    command_ready: Optional[str] = None
+    posix_command_ready: Optional[str] = None
     while True:
         readable, _, _ = select.select([fd], [], [], 0)
         if not readable:
@@ -210,7 +246,7 @@ def _read_nonblocking_command() -> Optional[str]:
             break
         char = data.decode(errors="ignore")
         if char in ("\n", "\r"):
-            command_ready = "".join(POSIX_INPUT_BUFFER).strip()
+            posix_command_ready = "".join(POSIX_INPUT_BUFFER).strip()
             POSIX_INPUT_BUFFER.clear()
             _clear_input_display()
             break
@@ -235,8 +271,8 @@ def _read_nonblocking_command() -> Optional[str]:
             continue
         POSIX_INPUT_BUFFER.append(char)
         _set_input_display("".join(POSIX_INPUT_BUFFER))
-    if command_ready:
-        return command_ready
+    if posix_command_ready:
+        return posix_command_ready
     return None
 
 
@@ -289,13 +325,13 @@ class LiveFrameTracker:
 
     def __init__(self, live: Live) -> None:
         self.live = live
-        self.last_frame: Optional[Tuple[str, Tuple[str, ...]]] = None
+        self.last_frame: Optional[FrameKey] = None
         self.latest_snapshot: Optional[str] = None
         self.last_input_state: str = ""
 
     def update(
         self,
-        frame_key: Tuple[str, Tuple[str, ...]],
+        frame_key: FrameKey,
         renderable: RenderableType,
         snapshot_markdown: Optional[str],
         input_state: Optional[str] = None,
@@ -435,6 +471,7 @@ def suppress_terminal_echo() -> Iterator[None]:
         import ctypes
         import msvcrt
 
+        typed_msvcrt = cast("_MsvcrtModule", msvcrt)
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         mode = ctypes.c_ulong()
@@ -451,8 +488,8 @@ def suppress_terminal_echo() -> Iterator[None]:
             yield
         finally:
             kernel32.SetConsoleMode(handle, mode.value)
-            while msvcrt.kbhit():
-                msvcrt.getwch()
+            while typed_msvcrt.kbhit():
+                typed_msvcrt.getwch()
     else:
         import termios
 
@@ -770,7 +807,7 @@ def watch_event_monitoring() -> None:
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
                     if error:
-                        frame_key = ("error", (error,))
+                        frame_key = _make_frame_key("error", error)
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Event Monitoring - Error",
@@ -797,7 +834,7 @@ def watch_event_monitoring() -> None:
 
                     output = stdout.rstrip()
                     if not output:
-                        frame_key = ("empty", ())
+                        frame_key = _make_frame_key("empty")
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Event Monitoring - Empty",
@@ -822,7 +859,7 @@ def watch_event_monitoring() -> None:
                         tracker.tick()
                         continue
 
-                    frame_key = ("data", (output,))
+                    frame_key = _make_frame_key("data", output)
                     snapshot = _format_plain_snapshot(
                         SnapshotPayload(
                             title="Event Monitoring",
@@ -952,7 +989,7 @@ def watch_pod_monitoring_by_creation() -> None:
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
                     if error:
-                        frame_key = ("error", (error,))
+                        frame_key = _make_frame_key("error", error)
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Pod Monitoring (생성 순) - Error",
@@ -979,7 +1016,7 @@ def watch_pod_monitoring_by_creation() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ())
+                            frame_key = _make_frame_key("empty")
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Pod Monitoring (생성 순) - Empty",
@@ -1004,7 +1041,7 @@ def watch_pod_monitoring_by_creation() -> None:
                             tracker.tick()
                             continue
                         else:
-                            frame_key = ("data", (output,))
+                            frame_key = _make_frame_key("data", output)
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Pod Monitoring (생성 순)",
@@ -1059,7 +1096,7 @@ def watch_non_running_pod() -> None:
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
                     if error:
-                        frame_key = ("error", (error,))
+                        frame_key = _make_frame_key("error", error)
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Non-Running Pod - Error",
@@ -1086,7 +1123,7 @@ def watch_non_running_pod() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ())
+                            frame_key = _make_frame_key("empty")
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Non-Running Pod - Empty",
@@ -1111,7 +1148,7 @@ def watch_non_running_pod() -> None:
                             tracker.tick()
                             continue
                         else:
-                            frame_key = ("data", (output,))
+                            frame_key = _make_frame_key("data", output)
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Non-Running Pod",
@@ -1186,14 +1223,12 @@ def watch_pod_counts() -> None:
                         if ns
                         else "Python client: CoreV1Api.list_pod_for_all_namespaces"
                     )
-                    frame_key = (
+                    frame_key = _make_frame_key(
                         "data",
-                        (
-                            command_descriptor,
-                            str(total),
-                            str(normal),
-                            str(abnormal),
-                        ),
+                        command_descriptor,
+                        str(total),
+                        str(normal),
+                        str(abnormal),
                     )
                     snapshot = _format_plain_snapshot(
                         SnapshotPayload(
@@ -1253,7 +1288,7 @@ def watch_node_monitoring_by_creation() -> None:
                 while True:
                     stdout, error = _run_shell_command(full_cmd)
                     if error:
-                        frame_key = ("error", (error,))
+                        frame_key = _make_frame_key("error", error)
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Node Monitoring (생성 순) - Error",
@@ -1280,7 +1315,7 @@ def watch_node_monitoring_by_creation() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ())
+                            frame_key = _make_frame_key("empty")
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Node Monitoring (생성 순) - Empty",
@@ -1305,7 +1340,7 @@ def watch_node_monitoring_by_creation() -> None:
                             tracker.tick()
                             continue
                         else:
-                            frame_key = ("data", (output,))
+                            frame_key = _make_frame_key("data", output)
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Node Monitoring (생성 순)",
@@ -1400,7 +1435,7 @@ def watch_unhealthy_nodes() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ())
+                            frame_key = ("empty", ("",))
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Unhealthy Node - Empty",
@@ -1531,7 +1566,7 @@ def watch_node_resources() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ())
+                            frame_key = ("empty", ("",))
                             snapshot = _format_plain_snapshot(
                                 SnapshotPayload(
                                     title="Node Resource Top - Empty",
@@ -1637,7 +1672,7 @@ def watch_pod_resources() -> None:
                 while True:
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
                     if error:
-                        frame_key = ("error", (error,))
+                        frame_key = _make_frame_key("error", error)
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Pod Resource Top - Error",
@@ -1663,7 +1698,7 @@ def watch_pod_resources() -> None:
                         continue
 
                     if not metrics:
-                        frame_key = ("empty_metrics", ())
+                        frame_key = _make_frame_key("empty_metrics", "")
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Pod Resource Top - Empty",
@@ -1708,7 +1743,7 @@ def watch_pod_resources() -> None:
                         )
 
                     if not enriched:
-                        frame_key = ("empty_filter", ())
+                        frame_key = _make_frame_key("empty_filter", "")
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Pod Resource Top - Filter Empty",
@@ -1735,12 +1770,14 @@ def watch_pod_resources() -> None:
 
                     if sort_key == "1":
                         enriched.sort(
-                            key=lambda item: item["cpu_millicores"], reverse=True
+                            key=lambda item: cast(int, item["cpu_millicores"]),
+                            reverse=True,
                         )
                         subtitle = "정렬 기준: CPU(cores)"
                     else:
                         enriched.sort(
-                            key=lambda item: item["memory_bytes"], reverse=True
+                            key=lambda item: cast(int, item["memory_bytes"]),
+                            reverse=True,
                         )
                         subtitle = "정렬 기준: Memory(bytes)"
 
@@ -1761,30 +1798,28 @@ def watch_pod_resources() -> None:
                     markdown_rows = []
                     for row in limited:
                         table.add_row(
-                            row["namespace"],
-                            row["pod"],
-                            row["cpu_raw"],
-                            row["memory_raw"],
-                            row["node"],
+                            str(row["namespace"]),
+                            str(row["pod"]),
+                            str(row["cpu_raw"]),
+                            str(row["memory_raw"]),
+                            str(row["node"]),
                         )
                         markdown_rows.append(
                             [
-                                row["namespace"],
-                                row["pod"],
-                                row["cpu_raw"],
-                                row["memory_raw"],
-                                row["node"],
+                                str(row["namespace"]),
+                                str(row["pod"]),
+                                str(row["cpu_raw"]),
+                                str(row["memory_raw"]),
+                                str(row["node"]),
                             ]
                         )
 
-                    frame_key = (
+                    frame_key = _make_frame_key(
                         "data",
-                        (
-                            subtitle,
-                            *(
-                                f"{r['namespace']}|{r['pod']}|{r['cpu_raw']}|{r['memory_raw']}|{r['node']}"
-                                for r in limited
-                            ),
+                        subtitle,
+                        *(
+                            f"{str(r['namespace'])}|{str(r['pod'])}|{str(r['cpu_raw'])}|{str(r['memory_raw'])}|{str(r['node'])}"
+                            for r in limited
                         ),
                     )
                     snapshot = _format_table_snapshot(
