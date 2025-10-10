@@ -11,17 +11,19 @@ Kubernetes 클러스터에서 이벤트, Pod, Node 상태 등을 빠르게 확�
 ### 주요 기능
 
 1. **Event Monitoring**
-   - 전체 이벤트 혹은 정상(Normal)이 아닌 이벤트만 실시간(`watch`)으로 모니터링
+   - 2초 간격으로 `kubectl get events`를 재실행해 최신 이벤트를 확인
+   - 실제로 실행된 `kubectl` 명령을 화면 하단에 함께 표기
 
 2. **Container Monitoring (재시작된 컨테이너 및 로그)**
    - 최근에 재시작된 컨테이너를 시간 기준으로 정렬하여 확인하고, 특정 컨테이너의 이전 로그(-p 옵션)를 확인
 
 3. **Pod Monitoring**
    - 생성된 순서, Running이 아닌 Pod, 전체/정상/비정상 Pod 개수를 조회
+   - CPU/Memory 사용량 기준 상위 Pod를 실시간으로 확인하며 NodeGroup 필터링 가능
 
 4. **Node Monitoring**
    - 생성된 순서(노드 정보), Unhealthy Node, CPU/Memory 사용량이 높은 노드를 확인
-   - NodeGroup(라벨 기반)으로 필터링 가능
+   - 모든 뷰에서 NodeGroup(라벨 기반) 필터링을 지원하고, 실행된 `kubectl` 명령을 하단에 노출
 
 ## Requirements
 
@@ -131,17 +133,28 @@ Kubernetes Monitoring Tool
 │ 3 │ Pod Monitoring (생성된 순서) [옵션: Pod IP 및 Node Name 표시]                     │
 │ 4 │ Pod Monitoring (Running이 아닌 Pod) [옵션: Pod IP 및 Node Name 표시]              │
 │ 5 │ Pod Monitoring (전체/정상/비정상 Pod 개수 출력)                                   │
-│ 6 │ Node Monitoring (생성된 순서) [AZ, NodeGroup 표시 및 필터링 가능]                 │
-│ 7 │ Node Monitoring (Unhealthy Node 확인) [AZ, NodeGroup 표시 및 필터링 가능]         │
-│ 8 │ Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]          │
+│ 6 │ Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]           │
+│ 7 │ Node Monitoring (생성된 순서) [AZ, NodeGroup 표시 및 필터링 가능]                 │
+│ 8 │ Node Monitoring (Unhealthy Node 확인) [AZ, NodeGroup 표시 및 필터링 가능]         │
+│ 9 │ Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]          │
 │ Q │ Quit                                                                              │
 ╰───┴───────────────────────────────────────────────────────────────────────────────────╯
 ```
 
+> 참고: Live 모니터링 중 입력한 키는 화면에 표시되지 않으며, 루프 종료 시 자동으로 버려집니다. 이를 통해 화면 밀림 없이 안정적으로 갱신됩니다.
+
+#### Slack 공유용 스냅샷 저장
+
+- Live 화면에서 `s`, `:s`, `save`, `:save`, `:export` 중 하나를 입력하고 Enter를 누르면 현재 프레임을 Slack 호환 Markdown으로 `/var/tmp/kmp/YYYY-MM-DD-HH-MM-SS.md` 경로에 저장합니다.
+- 출력 파일에는 화면에 표시된 표/텍스트와 함께 실제 실행된 `kubectl` 명령이 Markdown 형식으로 포함되며, 동일한 결과를 Slack 등에 붙여넣어도 가독성이 유지됩니다.
+- 저장이 완료되면 CLI 하단에 저장 경로가 표시됩니다.
+- `/var/tmp/kmp`에 쓰기 권한이 없으면 저장이 실패하며, CLI 하단에 오류 메시지가 표시됩니다. 운영 환경에서 권한을 사전에 점검하세요.
+- Live 모드 상단 `command input` 패널에서 `:` 프롬프트에 따라 입력 중인 문자열을 실시간으로 확인할 수 있어, `:save` 등 명령이 제대로 입력됐는지 즉시 파악할 수 있습니다.
+
 ### 1. Event Monitoring
 
-- 전체 이벤트 혹은 `type!=Normal` 이벤트를 실시간(`watch -n2`)으로 확인
-- 최신 이벤트부터 tail -n [사용자 지정] 개수로 표시
+- 전체 이벤트 혹은 `type!=Normal` 이벤트를 2초 간격으로 재조회하여 최신 상태를 확인
+- tail -n [사용자 지정] 개수만큼 표시하며, 실행된 `kubectl get events ...` 명령을 화면 하단에서 확인 가능
 
 ### 2. Container Monitoring (재시작된 컨테이너 및 로그)
 
@@ -150,31 +163,38 @@ Kubernetes Monitoring Tool
 
 ### 3. Pod Monitoring (생성된 순서)
 
-- Pod 생성 시간(`.metadata.creationTimestamp`) 기준 정렬
-- tail -n [사용자 지정] 개수 표시
+- `kubectl get po ... --sort-by=.metadata.creationTimestamp` 명령을 2초 간격으로 실행하여 최신 생성 순서를 확인
+- tail -n [사용자 지정] 개수만큼 표시하며, 화면 하단에서 실행 명령을 확인 가능
 
 ### 4. Pod Monitoring (Running이 아닌 Pod 확인)
 
-- `kubectl get pods` 결과에서 `grep -ivE 'Running'` 조건으로 Running이 아닌 Pod만 필터링
-- Pod IP 및 Node Name 확인 옵션
+- `kubectl get pods ... | grep -ivE ' Running'` 명령을 2초 간격으로 실행해 Running이 아닌 Pod만 필터링
+- Pod IP 및 Node Name 표시 옵션 제공, 실행 명령은 항상 화면 하단에 노출
 
 ### 5. Pod Monitoring (전체/정상/비정상 Pod 개수)
 
 - 2초 간격으로 전체 Pod 개수, 정상(Running 또는 Succeeded) Pod 개수, 비정상 Pod 개수를 표시
+- API 호출 결과가 변할 때만 콘솔을 갱신해 깜빡임을 최소화
 
-### 6. Node Monitoring (생성된 순서)
+### 6. Pod Monitoring (CPU/Memory 사용량 높은 순 정렬)
 
-- 노드의 생성 시간(`.metadata.creationTimestamp`) 기준 정렬
-- Zone(`topology.ebs.csi.aws.com/zone`)와 NodeGroup(`NODE_GROUP_LABEL`)을 표시 및 필터링 가능
+- `kubectl top pod` 결과를 2초마다 조회하고 CPU/Memory 기준으로 정렬하여 상위 N개 Pod를 표시
+- NodeGroup 라벨 기반 필터링을 지원하며, 실제 실행된 명령을 화면 하단에서 확인 가능
 
-### 7. Node Monitoring (Unhealthy Node 확인)
+### 7. Node Monitoring (생성된 순서)
 
-- `kubectl get nodes` 결과에서 `grep -ivE ' Ready'`로 Ready가 아닌 노드만 필터링
+- 노드 생성 시간(`.metadata.creationTimestamp`) 기준으로 정렬된 목록을 2초마다 재조회
+- Zone(`topology.ebs.csi.aws.com/zone`)와 NodeGroup(`NODE_GROUP_LABEL`)을 함께 출력하며, 실행 명령을 하단에 표기
 
-### 8. Node Monitoring (CPU/Memory 사용량 높은 순 정렬)
+### 8. Node Monitoring (Unhealthy Node 확인)
 
-- `kubectl top node` 결과에서 CPU나 메모리 기준으로 정렬 후 상위 N개 표시
-- NodeGroup 라벨 기반 필터링 가능 (`-l node.kubernetes.io/app=<값>`)
+- `kubectl get nodes ... | grep -ivE ' Ready '` 명령을 2초마다 실행하여 Ready가 아닌 노드만 필터링
+- NodeGroup 필터링을 지원하고, 실행 명령을 하단에서 제공
+
+### 9. Node Monitoring (CPU/Memory 사용량 높은 순 정렬)
+
+- `kubectl top node` 결과를 2초마다 조회해 CPU 혹은 메모리 기준으로 정렬, 상위 N개 노드를 표시
+- NodeGroup 라벨 기반 필터링을 지원하며, 실행된 명령을 항상 하단에서 확인 가능 (`-l node.kubernetes.io/app=<값>`)
 
 ## Development
 
