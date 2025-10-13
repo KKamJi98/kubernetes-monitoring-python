@@ -194,16 +194,19 @@ def _ensure_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.da
     return candidate.astimezone(datetime.timezone.utc)
 
 
+_DISPLAY_TIME_DELTA = datetime.timedelta(hours=9)
+_DISPLAY_TIMEZONE = datetime.timezone(_DISPLAY_TIME_DELTA, name="KST")
+_TIMEZONE_LABEL = "KST"
+_TIME_AWARE_HEADERS = {"LastSeen", "CreatedAt", "LastTerminatedTime"}
+
+
 def _format_timestamp(value: Optional[datetime.datetime]) -> str:
-    """UTC 기준의 포맷된 타임스탬프 문자열 반환."""
+    """표시용 타임스탬프 문자열(KST) 생성."""
     normalized = _ensure_datetime(value)
     if normalized is None:
         return "-"
-    return normalized.strftime("%Y-%m-%d %H:%M:%S")
-
-
-_TIMEZONE_LABEL = "UTC"
-_TIME_AWARE_HEADERS = {"LastSeen", "CreatedAt", "LastTerminatedTime"}
+    localized = normalized.astimezone(_DISPLAY_TIMEZONE)
+    return localized.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _label_time_header(header: str) -> str:
@@ -1552,7 +1555,7 @@ def view_restarted_container_logs() -> None:
     table.add_column("Container", overflow="fold")
     table.add_column(_label_time_header("LastTerminatedTime"))
     for i, (ns_pod, p_name, c_name, fat) in enumerate(displayed_containers, start=1):
-        table.add_row(str(i), ns_pod, p_name, c_name, fat.strftime("%Y-%m-%d %H:%M:%S"))
+        table.add_row(str(i), ns_pod, p_name, c_name, _format_timestamp(fat))
     console.print(
         f"\n=== 최근 재시작된 컨테이너 목록 (시간 기준, Top {line_count}) ===\n",
         style="bold green",

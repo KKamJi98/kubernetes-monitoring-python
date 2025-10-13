@@ -153,12 +153,12 @@ Kubernetes Monitoring Tool
   ```
   *:white_check_mark: Event Monitoring*
 
-  Namespace  LastSeen (UTC)       Type    Reason  Object                              Message
+  Namespace  LastSeen (KST)       Type    Reason  Object                              Message
   ---------  -------------------  ------  ------  ----------------------------------  ---------------
   default    2025-10-13 14:33:58  Normal  Valid   ClusterSecretStore/parameter-store  store validated
   ```
 - `.md` 파일에는 실행 명령이 포함되지 않으며, UI에서도 명령은 노출하지 않습니다.
-- 시간 컬럼 헤더는 UTC 기준으로 표기되며, 예: `LastSeen (UTC)`, `CreatedAt (UTC)`
+- 시간 컬럼 헤더는 KST(UTC+09:00) 기준으로 표기되며, 예: `LastSeen (KST)`, `CreatedAt (KST)`
 - `.csv` 파일은 동일한 데이터 집합을 구조화해 제공하며, 별도의 CSV 저장 명령(`csv`, `:csv`)도 동일 포맷으로 동작합니다.
 - 저장이 완료되면 CLI 하단에 두 파일 경로가 표시됩니다. `/var/tmp/kmp`에 쓰기 권한이 없으면 저장이 실패하며, 오류 메시지를 통해 원인을 안내합니다.
 - Live 모드 상단 `command input` 패널에서 `:` 프롬프트에 따라 입력 중인 문자열을 실시간으로 확인할 수 있어, `:save` 등 명령이 제대로 입력됐는지 즉시 파악할 수 있습니다.
