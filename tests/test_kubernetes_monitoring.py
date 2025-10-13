@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from rich.console import Console
+from rich.live import Live
+from rich.text import Text
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 import kubernetes_monitoring
@@ -196,3 +198,26 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     assert "입력 ':save' 처리 성공" in text_output
     assert "Slack Markdown 스냅샷 저장 완료" in text_output
     assert str(saved_path) in text_output
+
+
+def test_live_frame_tracker_updates_sections():
+    """LiveFrameTracker가 섹션별 프레임 키를 독립적으로 추적한다."""
+    kubernetes_monitoring._clear_input_display()
+    console = Console(record=True)
+    with Live(console=console, auto_refresh=False) as live:
+        tracker = kubernetes_monitoring.LiveFrameTracker(live)
+        frame_key = ("test", ("frame",))
+        renderable = kubernetes_monitoring._compose_group("cmd-1", Text("body-1"))
+        tracker.update(frame_key, renderable, snapshot_markdown=None, input_state="")
+        assert tracker.section_frames["input"] == ("input", ("hidden", ""))
+        assert tracker.section_frames["body"] == frame_key
+        assert tracker.section_frames["footer"] == ("footer", ("cmd-1",))
+
+        renderable_updated = kubernetes_monitoring._compose_group(
+            "cmd-2", Text("body-1")
+        )
+        tracker.update(
+            frame_key, renderable_updated, snapshot_markdown=None, input_state=""
+        )
+        assert tracker.section_frames["body"] == frame_key
+        assert tracker.section_frames["footer"] == ("footer", ("cmd-2",))

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     Iterator,
     List,
@@ -26,16 +27,19 @@ from typing import (
 
 try:
     from kubernetes import client, config
-    from kubernetes.client import CoreV1Api, V1NamespaceList, V1Pod
+    from kubernetes.client import CoreV1Api, CoreV1Event, V1NamespaceList, V1Node, V1Pod
     from kubernetes.client.exceptions import ApiException
 except ImportError:
     client = None  # type: ignore
     config = None  # type: ignore
     CoreV1Api = None  # type: ignore
+    CoreV1Event = None  # type: ignore
     V1Pod = None  # type: ignore
+    V1Node = None  # type: ignore
     ApiException = Exception  # type: ignore[assignment]
 from rich import box
 from rich.console import Console, Group, RenderableType
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -117,6 +121,95 @@ class SnapshotPayload:
     status: str
     body: str
     command: Optional[str]
+
+
+def _ensure_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+    """datetime 또는 ISO 문자열 입력을 UTC datetime으로 정규화."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        candidate = value
+    else:
+        try:
+            candidate = datetime.datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if candidate.tzinfo is None:
+        return candidate.replace(tzinfo=datetime.timezone.utc)
+    return candidate.astimezone(datetime.timezone.utc)
+
+
+def _format_timestamp(value: Optional[datetime.datetime]) -> str:
+    """UTC 기준의 포맷된 타임스탬프 문자열 반환."""
+    normalized = _ensure_datetime(value)
+    if normalized is None:
+        return "-"
+    return normalized.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_tail_count(raw: str) -> int:
+    """tail -n 입력 문자열을 안전한 정수로 변환."""
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return 20
+    return max(count, 1)
+
+
+def _sanitize_multiline(text: Optional[str]) -> str:
+    """다중 공백을 공백 하나로 축소하고 줄바꿈을 공백으로 치환."""
+    if not text:
+        return "-"
+    return " ".join(str(text).split())
+
+
+def _event_timestamp(event: Any) -> Optional[datetime.datetime]:
+    """CoreV1Event 유사 객체에서 관측 시각을 추출."""
+    candidates = [
+        getattr(event, "last_timestamp", None),
+        getattr(event, "event_time", None),
+        getattr(event, "deprecated_last_timestamp", None),
+        getattr(getattr(event, "metadata", None), "creation_timestamp", None),
+        getattr(event, "first_timestamp", None),
+    ]
+    for candidate in candidates:
+        normalized = _ensure_datetime(candidate)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _node_ready_condition(node: Any) -> str:
+    """노드 Ready 조건을 요약 문자열로 반환."""
+    conditions = getattr(getattr(node, "status", None), "conditions", None) or []
+    for condition in conditions:
+        if getattr(condition, "type", "") == "Ready":
+            status = getattr(condition, "status", "")
+            if status == "True":
+                return "Ready"
+            if status == "False":
+                return "NotReady"
+            return status or "-"
+    return "-"
+
+
+def _node_roles(node: Any) -> str:
+    """노드 라벨에서 역할(role) 정보를 추출."""
+    labels = getattr(getattr(node, "metadata", None), "labels", None) or {}
+    roles = [
+        label.split("/")[-1]
+        for label in labels
+        if label.startswith("node-role.kubernetes.io/")
+    ]
+    if not roles:
+        return "<none>"
+    return ",".join(sorted(roles))
+
+
+def _node_zone(node: Any) -> str:
+    """노드에 설정된 가용 영역 라벨을 반환."""
+    labels = getattr(getattr(node, "metadata", None), "labels", None) or {}
+    return labels.get("topology.ebs.csi.aws.com/zone", "-")
 
 
 def _log_k8s_error(
@@ -350,9 +443,44 @@ class LiveFrameTracker:
 
     def __init__(self, live: Live) -> None:
         self.live = live
-        self.last_frame: Optional[FrameKey] = None
+        self.layout = Layout(name="root")
+        self.layout.split(
+            Layout(name="input", size=3),
+            Layout(name="body", ratio=1),
+            Layout(name="footer", size=3),
+        )
+        self.layout["input"].visible = False
+        self.layout["input"].update(Text(""))
+        self.layout["body"].update(Text(""))
+        self.layout["footer"].visible = False
+        self.layout["footer"].update(Text(""))
+        self.section_frames: Dict[str, Optional[FrameKey]] = {
+            "input": None,
+            "body": None,
+            "footer": None,
+        }
         self.latest_snapshot: Optional[str] = None
         self.last_input_state: str = ""
+        self.live.update(self.layout)
+
+    def _sync_input_panel(
+        self,
+        current_input_state: str,
+        input_renderable: Optional[RenderableType] = None,
+    ) -> bool:
+        visible = COMMAND_INPUT_VISIBLE
+        visibility_flag = "visible" if visible else "hidden"
+        input_key: FrameKey = ("input", (visibility_flag, current_input_state))
+        if input_key == self.section_frames["input"]:
+            return False
+        self.section_frames["input"] = input_key
+        self.last_input_state = current_input_state
+        self.layout["input"].visible = visible
+        if visible:
+            self.layout["input"].update(input_renderable or _CommandInputPanel())
+        else:
+            self.layout["input"].update(Text(""))
+        return True
 
     def update(
         self,
@@ -364,24 +492,49 @@ class LiveFrameTracker:
         current_input_state = (
             input_state if input_state is not None else CURRENT_INPUT_DISPLAY
         )
-        if current_input_state != self.last_input_state:
-            self.last_input_state = current_input_state
-            self.last_frame = None
-        if frame_key != self.last_frame:
-            self.live.update(renderable)
+        body_renderable: RenderableType = renderable
+        footer_renderable: Optional[RenderableType] = None
+        command_descriptor = ""
+        input_renderable: Optional[RenderableType] = None
+
+        if isinstance(renderable, _FrameRenderable):
+            body_renderable = _merge_renderables(renderable.body_renderables)
+            footer_renderable = renderable.footer_panel
+            command_descriptor = renderable.command
+            input_renderable = renderable.input_panel
+
+        changed = self._sync_input_panel(current_input_state, input_renderable)
+
+        if frame_key != self.section_frames["body"]:
+            self.section_frames["body"] = frame_key
+            self.layout["body"].update(body_renderable)
+            changed = True
+
+        previous_footer = self.section_frames["footer"]
+        if footer_renderable is None:
+            if previous_footer is not None:
+                self.section_frames["footer"] = None
+                self.layout["footer"].visible = False
+                self.layout["footer"].update(Text(""))
+                changed = True
+        else:
+            footer_key: FrameKey = ("footer", (command_descriptor,))
+            if footer_key != previous_footer:
+                self.section_frames["footer"] = footer_key
+                self.layout["footer"].visible = True
+                self.layout["footer"].update(footer_renderable)
+                changed = True
+
+        if changed:
             self.live.refresh()
-            self.last_frame = frame_key
         if snapshot_markdown is not None:
             self.latest_snapshot = snapshot_markdown
 
     def tick(self, interval: float = LIVE_REFRESH_INTERVAL) -> None:
         deadline = time.monotonic() + interval
         while True:
-            previous_input = self.last_input_state
             _tick_iteration(self.live, self.latest_snapshot)
-            current_input = CURRENT_INPUT_DISPLAY
-            if current_input != previous_input:
-                self.last_input_state = current_input
+            if self._sync_input_panel(CURRENT_INPUT_DISPLAY):
                 self.live.refresh()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -460,6 +613,15 @@ def _command_panel(command: str) -> Panel:
     )
 
 
+def _merge_renderables(renderables: Sequence[RenderableType]) -> RenderableType:
+    """렌더러 목록을 단일 RenderableType으로 축약."""
+    if not renderables:
+        return Text("")
+    if len(renderables) == 1:
+        return renderables[0]
+    return Group(*renderables)
+
+
 class _CommandInputPanel:
     """COMMAND_INPUT_VISIBLE 상태에 따라 패널을 조건부로 출력."""
 
@@ -476,13 +638,33 @@ class _CommandInputPanel:
         )
 
 
-def _compose_group(command: str, *renderables: RenderableType) -> Group:
-    """메인 콘텐츠와 kubectl 명령을 하단에 배치한 그룹 구성."""
-    items: List[RenderableType] = []
-    items.append(_CommandInputPanel())
-    items.extend(renderables)
-    items.append(_command_panel(command))
-    return Group(*items)
+class _FrameRenderable:
+    """입력 패널, 메인 콘텐츠, 명령 패널을 하나의 렌더러로 묶는다."""
+
+    def __init__(self, command: str, *renderables: RenderableType) -> None:
+        self.command = command
+        self.body_renderables: List[RenderableType] = list(renderables)
+        self._input_panel = _CommandInputPanel()
+        self._footer_panel = _command_panel(command)
+
+    def __rich_console__(self, console: Console, options):  # type: ignore[override]
+        yield self._input_panel
+        for item in self.body_renderables:
+            yield item
+        yield self._footer_panel
+
+    @property
+    def input_panel(self) -> RenderableType:
+        return self._input_panel
+
+    @property
+    def footer_panel(self) -> RenderableType:
+        return self._footer_panel
+
+
+def _compose_group(command: str, *renderables: RenderableType) -> _FrameRenderable:
+    """메인 콘텐츠와 kubectl 명령을 묶어 FrameRenderable 생성."""
+    return _FrameRenderable(command, *renderables)
 
 
 @contextlib.contextmanager
@@ -729,7 +911,7 @@ def choose_namespace() -> Optional[str]:
 
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("Index", style="bold green", width=5)
-    table.add_column("Namespace")
+    table.add_column("Namespace", overflow="fold")
     for idx, ns in enumerate(items, start=1):
         table.add_row(str(idx), ns.metadata.name)
     console.print("\n=== Available Namespaces ===", style="bold green")
@@ -775,7 +957,7 @@ def choose_node_group() -> Optional[str]:
         return None
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("Index", style="bold green", width=5)
-    table.add_column("Node Group")
+    table.add_column("Node Group", overflow="fold")
     for idx, ng in enumerate(node_groups, start=1):
         table.add_row(str(idx), ng)
     console.print("\n=== Available Node Groups ===", style="bold green")
@@ -865,19 +1047,18 @@ def watch_event_monitoring() -> None:
         "어떤 이벤트를 보시겠습니까? (1: 전체 이벤트(default), 2: 비정상 이벤트(!=Normal))",
         default="1",
     )
-    tail_num = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_limit = _parse_tail_count(tail_num_raw)
 
-    ns_option = f"-n {ns}" if ns else "-A"
-    if event_choice == "2":
-        base_cmd = (
-            f"kubectl get events {ns_option} "
-            '--field-selector type!=Normal --sort-by=".metadata.managedFields[].time"'
-        )
+    load_kube_config()
+    v1 = client.CoreV1Api()
+    field_selector = "type!=Normal" if event_choice == "2" else None
+    if ns:
+        command_descriptor = "Python client: CoreV1Api.list_namespaced_event"
     else:
-        base_cmd = (
-            f'kubectl get events {ns_option} --sort-by=".metadata.managedFields[].time"'
-        )
-    full_cmd = f"{base_cmd} | tail -n {tail_num}"
+        command_descriptor = "Python client: CoreV1Api.list_event_for_all_namespaces"
+    if field_selector:
+        command_descriptor = f"{command_descriptor} (field_selector={field_selector})"
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -885,26 +1066,94 @@ def watch_event_monitoring() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    stdout, error = _run_shell_command(full_cmd)
-                    if error:
-                        frame_key = _make_frame_key("error", error)
+                    try:
+                        if ns:
+                            response = v1.list_namespaced_event(
+                                namespace=ns,
+                                field_selector=field_selector,
+                                _request_timeout=API_REQUEST_TIMEOUT,
+                            )
+                        else:
+                            response = v1.list_event_for_all_namespaces(
+                                field_selector=field_selector,
+                                _request_timeout=API_REQUEST_TIMEOUT,
+                            )
+                    except (
+                        MaxRetryError,
+                        ConnectTimeoutError,
+                        ReadTimeoutError,
+                        socket.timeout,
+                    ) as exc:
+                        message = (
+                            "이벤트 정보를 가져오는 중 네트워크 지연이 감지되었습니다. "
+                            "VPN 혹은 인증 세션 상태를 점검해 주세요."
+                        )
+                        frame_key = _make_frame_key("timeout", str(exc))
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
-                                title="Event Monitoring - Error",
-                                status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
-                                command=full_cmd,
+                                title="Event Monitoring - Timeout",
+                                status="warning",
+                                body=message,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
-                                Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
-                                    style="bold red",
-                                ),
+                                command_descriptor,
+                                Panel(message, title="경고", style="bold yellow"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except ApiException as exc:
+                        status = getattr(exc, "status", "unknown")
+                        reason = getattr(exc, "reason", "")
+                        detail = getattr(exc, "body", "") or str(exc)
+                        message = (
+                            f"이벤트 정보를 가져오는 중 API 오류가 발생했습니다. "
+                            f"(HTTP {status} {reason})"
+                        )
+                        frame_key = _make_frame_key(
+                            "api_error", str(status), reason, detail
+                        )
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Event Monitoring - Error",
+                                status="error",
+                                body=f"{message}\n세부 정보: {detail}",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
+                        message = f"이벤트 정보를 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
+                        frame_key = _make_frame_key("unexpected_error", str(exc))
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Event Monitoring - Error",
+                                status="error",
+                                body=message,
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
                             ),
                             snapshot,
                             input_state=CURRENT_INPUT_DISPLAY,
@@ -912,21 +1161,21 @@ def watch_event_monitoring() -> None:
                         tracker.tick()
                         continue
 
-                    output = stdout.rstrip()
-                    if not output:
+                    items = list(getattr(response, "items", []) or [])
+                    if not items:
                         frame_key = _make_frame_key("empty")
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
                                 title="Event Monitoring - Empty",
                                 status="empty",
                                 body="표시할 이벤트가 없습니다.",
-                                command=full_cmd,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
+                                command_descriptor,
                                 Panel(
                                     "표시할 이벤트가 없습니다.",
                                     title="정보",
@@ -939,25 +1188,91 @@ def watch_event_monitoring() -> None:
                         tracker.tick()
                         continue
 
-                    frame_key = _make_frame_key("data", output)
-                    snapshot = _format_plain_snapshot(
-                        SnapshotPayload(
-                            title="Event Monitoring",
-                            status="success",
-                            body=output,
-                            command=full_cmd,
+                    sorted_items = sorted(
+                        items,
+                        key=lambda event: _event_timestamp(event)
+                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                    )
+                    selected = sorted_items[-tail_limit:]
+                    table = Table(
+                        show_header=True, header_style="bold magenta", box=box.ROUNDED
+                    )
+                    table.add_column("Namespace", style="bold green", overflow="fold")
+                    table.add_column("LastSeen")
+                    table.add_column("Type")
+                    table.add_column("Reason")
+                    table.add_column("Object")
+                    table.add_column("Message", overflow="fold")
+
+                    markdown_rows: List[List[str]] = []
+                    frame_parts: List[str] = []
+                    for event in selected:
+                        metadata = getattr(event, "metadata", None)
+                        namespace = getattr(metadata, "namespace", "-") or "-"
+                        last_seen = _format_timestamp(_event_timestamp(event))
+                        event_type = getattr(event, "type", "") or "-"
+                        reason = getattr(event, "reason", "") or "-"
+                        involved = getattr(event, "involved_object", None)
+                        involved_name = getattr(involved, "name", "") or "-"
+                        involved_kind = getattr(involved, "kind", "")
+                        object_ref = (
+                            f"{involved_kind}/{involved_name}"
+                            if involved_kind
+                            else involved_name
                         )
+                        message = _sanitize_multiline(getattr(event, "message", None))
+                        count = getattr(event, "count", 0) or 0
+
+                        table.add_row(
+                            namespace,
+                            last_seen,
+                            event_type,
+                            reason,
+                            object_ref,
+                            message,
+                        )
+                        markdown_rows.append(
+                            [
+                                namespace,
+                                last_seen,
+                                event_type,
+                                reason,
+                                object_ref,
+                                message,
+                            ]
+                        )
+                        frame_parts.append(
+                            "|".join(
+                                [
+                                    namespace,
+                                    last_seen,
+                                    event_type,
+                                    reason,
+                                    object_ref,
+                                    message,
+                                    str(count),
+                                ]
+                            )
+                        )
+
+                    frame_key = _make_frame_key("data", *frame_parts)
+                    snapshot = _format_table_snapshot(
+                        title="Event Monitoring",
+                        headers=[
+                            "Namespace",
+                            "LastSeen",
+                            "Type",
+                            "Reason",
+                            "Object",
+                            "Message",
+                        ],
+                        rows=markdown_rows,
+                        command=command_descriptor,
+                        status="success",
                     )
                     tracker.update(
                         frame_key,
-                        _compose_group(
-                            full_cmd,
-                            Panel(
-                                output,
-                                title="Result",
-                                border_style="green",
-                            ),
-                        ),
+                        _compose_group(command_descriptor, table),
                         snapshot,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
@@ -1006,9 +1321,9 @@ def view_restarted_container_logs() -> None:
 
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("INDEX", style="bold green", width=5)
-    table.add_column("Namespace")
-    table.add_column("Pod")
-    table.add_column("Container")
+    table.add_column("Namespace", overflow="fold")
+    table.add_column("Pod", overflow="fold")
+    table.add_column("Container", overflow="fold")
     table.add_column("LastTerminatedTime")
     for i, (ns_pod, p_name, c_name, fat) in enumerate(displayed_containers, start=1):
         table.add_row(str(i), ns_pod, p_name, c_name, fat.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1051,15 +1366,21 @@ def watch_pod_monitoring_by_creation() -> None:
         .strip()
         .lower()
     )
-    tail_num = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
-    ns_option = f"-n {ns}" if ns else "-A"
-    if extra.startswith("y"):
-        base_cmd = (
-            f"kubectl get po {ns_option} -o wide --sort-by=.metadata.creationTimestamp"
+    show_extra = extra.startswith("y")
+    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_limit = _parse_tail_count(tail_num_raw)
+
+    load_kube_config()
+    v1 = client.CoreV1Api()
+    if ns:
+        command_descriptor = (
+            "Python client: CoreV1Api.list_namespaced_pod (sorted by creationTimestamp)"
         )
     else:
-        base_cmd = f"kubectl get po {ns_option} --sort-by=.metadata.creationTimestamp"
-    full_cmd = f"{base_cmd} | tail -n {tail_num}"
+        command_descriptor = (
+            "Python client: CoreV1Api.list_pod_for_all_namespaces "
+            "(sorted by creationTimestamp)"
+        )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1067,25 +1388,118 @@ def watch_pod_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    stdout, error = _run_shell_command(full_cmd)
-                    if error:
-                        frame_key = _make_frame_key("error", error)
+                    try:
+                        if ns:
+                            response = v1.list_namespaced_pod(
+                                namespace=ns,
+                                _request_timeout=API_REQUEST_TIMEOUT,
+                            )
+                        else:
+                            response = v1.list_pod_for_all_namespaces(
+                                _request_timeout=API_REQUEST_TIMEOUT
+                            )
+                        pods = list(getattr(response, "items", []) or [])
+                    except (
+                        MaxRetryError,
+                        ConnectTimeoutError,
+                        ReadTimeoutError,
+                        socket.timeout,
+                    ) as exc:
+                        message = (
+                            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다. "
+                            "네트워크 연결과 인증 상태를 확인하세요."
+                        )
+                        frame_key = _make_frame_key("timeout", str(exc))
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
-                                title="Pod Monitoring (생성 순) - Error",
-                                status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
-                                command=full_cmd,
+                                title="Pod Monitoring (생성 순) - Timeout",
+                                status="warning",
+                                body=message,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
+                                command_descriptor,
+                                Panel(message, title="경고", style="bold yellow"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except ApiException as exc:
+                        status = getattr(exc, "status", "unknown")
+                        reason = getattr(exc, "reason", "")
+                        detail = getattr(exc, "body", "") or str(exc)
+                        message = (
+                            f"Pod 목록을 조회하는 중 API 오류가 발생했습니다. "
+                            f"(HTTP {status} {reason})"
+                        )
+                        frame_key = _make_frame_key(
+                            "api_error", str(status), reason, detail
+                        )
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Pod Monitoring (생성 순) - Error",
+                                status="error",
+                                body=f"{message}\n세부 정보: {detail}",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
+                        message = f"Pod 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
+                        frame_key = _make_frame_key("unexpected_error", str(exc))
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Pod Monitoring (생성 순) - Error",
+                                status="error",
+                                body=message,
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+
+                    if not pods:
+                        frame_key = _make_frame_key("empty")
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Pod Monitoring (생성 순) - Empty",
+                                status="empty",
+                                body="표시할 결과가 없습니다.",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
                                 Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
-                                    style="bold red",
+                                    "표시할 결과가 없습니다.",
+                                    title="정보",
+                                    style="bold yellow",
                                 ),
                             ),
                             snapshot,
@@ -1093,56 +1507,134 @@ def watch_pod_monitoring_by_creation() -> None:
                         )
                         tracker.tick()
                         continue
-                    else:
-                        output = stdout.rstrip()
-                        if not output:
-                            frame_key = _make_frame_key("empty")
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Pod Monitoring (생성 순) - Empty",
-                                    status="empty",
-                                    body="표시할 결과가 없습니다.",
-                                    command=full_cmd,
+
+                    sorted_pods = sorted(
+                        pods,
+                        key=lambda pod: _ensure_datetime(
+                            getattr(
+                                getattr(pod, "metadata", None),
+                                "creation_timestamp",
+                                None,
+                            )
+                        )
+                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                    )
+                    selected = sorted_pods[-tail_limit:]
+
+                    table = Table(
+                        show_header=True, header_style="bold magenta", box=box.ROUNDED
+                    )
+                    include_namespace = ns is None
+                    if include_namespace:
+                        table.add_column(
+                            "Namespace", style="bold green", overflow="fold"
+                        )
+                    table.add_column("Name", overflow="fold")
+                    table.add_column("Ready")
+                    table.add_column("Status")
+                    table.add_column("Restarts", justify="right")
+                    table.add_column("CreatedAt")
+                    if show_extra:
+                        table.add_column("PodIP")
+                        table.add_column("Node", overflow="fold")
+
+                    markdown_rows: List[List[str]] = []
+                    frame_parts: List[str] = []
+                    for pod in selected:
+                        metadata = getattr(pod, "metadata", None)
+                        status = getattr(pod, "status", None)
+                        spec = getattr(pod, "spec", None)
+
+                        namespace = getattr(metadata, "namespace", "-") or "-"
+                        name = getattr(metadata, "name", "-") or "-"
+                        creation = _format_timestamp(
+                            getattr(metadata, "creation_timestamp", None)
+                        )
+                        container_statuses = list(
+                            getattr(status, "container_statuses", None) or []
+                        )
+                        ready_count = sum(
+                            1
+                            for item in container_statuses
+                            if getattr(item, "ready", False)
+                        )
+                        total_containers = (
+                            len(container_statuses)
+                            if container_statuses
+                            else len(getattr(spec, "containers", []) or [])
+                        )
+                        ready_display = (
+                            f"{ready_count}/{total_containers}"
+                            if total_containers
+                            else "0/0"
+                        )
+                        restarts = sum(
+                            int(getattr(item, "restart_count", 0))
+                            for item in container_statuses
+                        )
+                        phase = getattr(status, "phase", "") or "-"
+                        pod_ip = getattr(status, "pod_ip", "") or "-"
+                        node_name = getattr(spec, "node_name", "") or "-"
+
+                        row: List[str] = []
+                        if include_namespace:
+                            row.append(namespace)
+                        row.extend(
+                            [
+                                name,
+                                ready_display,
+                                phase,
+                                str(restarts),
+                                creation,
+                            ]
+                        )
+                        if show_extra:
+                            row.extend([pod_ip, node_name])
+                        table.add_row(*row)
+
+                        markdown_row = row.copy()
+                        markdown_rows.append(markdown_row)
+                        frame_parts.append(
+                            "|".join(
+                                row
+                                + (
+                                    [
+                                        namespace if include_namespace else "",
+                                        pod_ip if show_extra else "",
+                                        node_name if show_extra else "",
+                                    ]
                                 )
                             )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        "표시할 결과가 없습니다.",
-                                        title="정보",
-                                        style="bold yellow",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
-                            tracker.tick()
-                            continue
-                        else:
-                            frame_key = _make_frame_key("data", output)
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Pod Monitoring (생성 순)",
-                                    status="success",
-                                    body=output,
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        output,
-                                        title="Result",
-                                        border_style="green",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
+                        )
+
+                    frame_key = _make_frame_key("data", *frame_parts)
+                    headers = (
+                        [
+                            "Namespace",
+                            "Name",
+                            "Ready",
+                            "Status",
+                            "Restarts",
+                            "CreatedAt",
+                        ]
+                        if include_namespace
+                        else ["Name", "Ready", "Status", "Restarts", "CreatedAt"]
+                    )
+                    if show_extra:
+                        headers.extend(["PodIP", "Node"])
+                    snapshot = _format_table_snapshot(
+                        title="Pod Monitoring (생성 순)",
+                        headers=headers,
+                        rows=markdown_rows,
+                        command=command_descriptor,
+                        status="success",
+                    )
+                    tracker.update(
+                        frame_key,
+                        _compose_group(command_descriptor, table),
+                        snapshot,
+                        input_state=CURRENT_INPUT_DISPLAY,
+                    )
                     tracker.tick()
     except KeyboardInterrupt:
         console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
@@ -1160,13 +1652,20 @@ def watch_non_running_pod() -> None:
         .strip()
         .lower()
     )
-    tail_num = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
-    ns_option = f"-n {ns}" if ns else "-A"
-    if extra.startswith("y"):
-        base_cmd = f"kubectl get pods {ns_option} -o wide"
+    show_extra = extra.startswith("y")
+    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_limit = _parse_tail_count(tail_num_raw)
+
+    load_kube_config()
+    v1 = client.CoreV1Api()
+    if ns:
+        command_descriptor = (
+            "Python client: CoreV1Api.list_namespaced_pod (exclude Running)"
+        )
     else:
-        base_cmd = f"kubectl get pods {ns_option}"
-    full_cmd = f"{base_cmd} | grep -ivE ' Running' | tail -n {tail_num}"
+        command_descriptor = (
+            "Python client: CoreV1Api.list_pod_for_all_namespaces (exclude Running)"
+        )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1174,25 +1673,123 @@ def watch_non_running_pod() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    stdout, error = _run_shell_command(full_cmd)
-                    if error:
-                        frame_key = _make_frame_key("error", error)
+                    try:
+                        if ns:
+                            response = v1.list_namespaced_pod(
+                                namespace=ns,
+                                _request_timeout=API_REQUEST_TIMEOUT,
+                            )
+                        else:
+                            response = v1.list_pod_for_all_namespaces(
+                                _request_timeout=API_REQUEST_TIMEOUT
+                            )
+                        pods = list(getattr(response, "items", []) or [])
+                    except (
+                        MaxRetryError,
+                        ConnectTimeoutError,
+                        ReadTimeoutError,
+                        socket.timeout,
+                    ) as exc:
+                        message = (
+                            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다. "
+                            "네트워크 연결과 인증 상태를 확인하세요."
+                        )
+                        frame_key = _make_frame_key("timeout", str(exc))
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
-                                title="Non-Running Pod - Error",
-                                status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
-                                command=full_cmd,
+                                title="Non-Running Pod - Timeout",
+                                status="warning",
+                                body=message,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
+                                command_descriptor,
+                                Panel(message, title="경고", style="bold yellow"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except ApiException as exc:
+                        status = getattr(exc, "status", "unknown")
+                        reason = getattr(exc, "reason", "")
+                        detail = getattr(exc, "body", "") or str(exc)
+                        message = (
+                            f"Pod 목록을 조회하는 중 API 오류가 발생했습니다. "
+                            f"(HTTP {status} {reason})"
+                        )
+                        frame_key = _make_frame_key(
+                            "api_error", str(status), reason, detail
+                        )
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Non-Running Pod - Error",
+                                status="error",
+                                body=f"{message}\n세부 정보: {detail}",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
+                        message = f"Pod 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
+                        frame_key = _make_frame_key("unexpected_error", str(exc))
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Non-Running Pod - Error",
+                                status="error",
+                                body=message,
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+
+                    def _is_non_running(pod: V1Pod) -> bool:
+                        phase = getattr(getattr(pod, "status", None), "phase", "")
+                        return phase not in ("Running", "Succeeded")
+
+                    filtered = [pod for pod in pods if _is_non_running(pod)]
+                    if not filtered:
+                        frame_key = _make_frame_key("empty")
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Non-Running Pod - Empty",
+                                status="empty",
+                                body="조건에 해당하는 Pod가 없습니다.",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
                                 Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
-                                    style="bold red",
+                                    "조건에 해당하는 Pod가 없습니다.",
+                                    title="정보",
+                                    style="bold yellow",
                                 ),
                             ),
                             snapshot,
@@ -1200,56 +1797,121 @@ def watch_non_running_pod() -> None:
                         )
                         tracker.tick()
                         continue
-                    else:
-                        output = stdout.rstrip()
-                        if not output:
-                            frame_key = _make_frame_key("empty")
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Non-Running Pod - Empty",
-                                    status="empty",
-                                    body="조건에 해당하는 Pod가 없습니다.",
-                                    command=full_cmd,
+
+                    sorted_filtered = sorted(
+                        filtered,
+                        key=lambda pod: (
+                            getattr(getattr(pod, "metadata", None), "name", "") or ""
+                        ),
+                    )
+                    selected = sorted_filtered[-tail_limit:]
+
+                    table = Table(
+                        show_header=True, header_style="bold magenta", box=box.ROUNDED
+                    )
+                    include_namespace = ns is None
+                    if include_namespace:
+                        table.add_column(
+                            "Namespace", style="bold green", overflow="fold"
+                        )
+                    table.add_column("Name", overflow="fold")
+                    table.add_column("Phase")
+                    table.add_column("Ready")
+                    table.add_column("Restarts", justify="right")
+                    table.add_column("CreatedAt")
+                    if show_extra:
+                        table.add_column("PodIP")
+                        table.add_column("Node", overflow="fold")
+
+                    markdown_rows: List[List[str]] = []
+                    frame_parts: List[str] = []
+                    for pod in selected:
+                        metadata = getattr(pod, "metadata", None)
+                        status = getattr(pod, "status", None)
+                        spec = getattr(pod, "spec", None)
+
+                        namespace = getattr(metadata, "namespace", "-") or "-"
+                        name = getattr(metadata, "name", "-") or "-"
+                        creation = _format_timestamp(
+                            getattr(metadata, "creation_timestamp", None)
+                        )
+                        container_statuses = list(
+                            getattr(status, "container_statuses", None) or []
+                        )
+                        ready_count = sum(
+                            1
+                            for item in container_statuses
+                            if getattr(item, "ready", False)
+                        )
+                        total_containers = (
+                            len(container_statuses)
+                            if container_statuses
+                            else len(getattr(spec, "containers", []) or [])
+                        )
+                        ready_display = (
+                            f"{ready_count}/{total_containers}"
+                            if total_containers
+                            else "0/0"
+                        )
+                        restarts = sum(
+                            int(getattr(item, "restart_count", 0))
+                            for item in container_statuses
+                        )
+                        phase = getattr(status, "phase", "") or "-"
+                        pod_ip = getattr(status, "pod_ip", "") or "-"
+                        node_name = getattr(spec, "node_name", "") or "-"
+
+                        row: List[str] = []
+                        if include_namespace:
+                            row.append(namespace)
+                        row.extend(
+                            [
+                                name,
+                                phase,
+                                ready_display,
+                                str(restarts),
+                                creation,
+                            ]
+                        )
+                        if show_extra:
+                            row.extend([pod_ip, node_name])
+                        table.add_row(*row)
+
+                        markdown_rows.append(row.copy())
+                        frame_parts.append(
+                            "|".join(
+                                row
+                                + (
+                                    [
+                                        namespace if include_namespace else "",
+                                        pod_ip if show_extra else "",
+                                        node_name if show_extra else "",
+                                    ]
                                 )
                             )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        "조건에 해당하는 Pod가 없습니다.",
-                                        title="정보",
-                                        style="bold yellow",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
-                            tracker.tick()
-                            continue
-                        else:
-                            frame_key = _make_frame_key("data", output)
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Non-Running Pod",
-                                    status="success",
-                                    body=output,
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        output,
-                                        title="Result",
-                                        border_style="green",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
+                        )
+
+                    frame_key = _make_frame_key("data", *frame_parts)
+                    headers = (
+                        ["Namespace", "Name", "Phase", "Ready", "Restarts", "CreatedAt"]
+                        if include_namespace
+                        else ["Name", "Phase", "Ready", "Restarts", "CreatedAt"]
+                    )
+                    if show_extra:
+                        headers.extend(["PodIP", "Node"])
+                    snapshot = _format_table_snapshot(
+                        title="Non-Running Pod",
+                        headers=headers,
+                        rows=markdown_rows,
+                        command=command_descriptor,
+                        status="success",
+                    )
+                    tracker.update(
+                        frame_key,
+                        _compose_group(command_descriptor, table),
+                        snapshot,
+                        input_state=CURRENT_INPUT_DISPLAY,
+                    )
                     tracker.tick()
     except KeyboardInterrupt:
         console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
@@ -1344,21 +2006,18 @@ def watch_node_monitoring_by_creation() -> None:
         filter_nodegroup = choose_node_group() or ""
     else:
         filter_nodegroup = ""
-    tail_num = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_limit = _parse_tail_count(tail_num_raw)
 
+    load_kube_config()
+    v1 = client.CoreV1Api()
+    command_descriptor = (
+        "Python client: CoreV1Api.list_node (sorted by creationTimestamp)"
+    )
     if filter_nodegroup:
-        base_cmd = (
-            f"kubectl get nodes -l {NODE_GROUP_LABEL}={filter_nodegroup} "
-            f"-L topology.ebs.csi.aws.com/zone -L {NODE_GROUP_LABEL} "
-            "--sort-by=.metadata.creationTimestamp"
+        command_descriptor = (
+            f"{command_descriptor} (filter {NODE_GROUP_LABEL}={filter_nodegroup})"
         )
-    else:
-        base_cmd = (
-            "kubectl get nodes "
-            "-L topology.ebs.csi.aws.com/zone -L {label} "
-            "--sort-by=.metadata.creationTimestamp"
-        ).format(label=NODE_GROUP_LABEL)
-    full_cmd = f"{base_cmd} | tail -n {tail_num}"
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1366,25 +2025,121 @@ def watch_node_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    stdout, error = _run_shell_command(full_cmd)
-                    if error:
-                        frame_key = _make_frame_key("error", error)
+                    try:
+                        response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
+                        nodes = list(getattr(response, "items", []) or [])
+                    except (
+                        MaxRetryError,
+                        ConnectTimeoutError,
+                        ReadTimeoutError,
+                        socket.timeout,
+                    ) as exc:
+                        message = (
+                            "노드 정보를 가져오는 중 API 응답이 지연되었습니다. "
+                            "네트워크 연결과 인증 상태를 확인하세요."
+                        )
+                        frame_key = _make_frame_key("timeout", str(exc))
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
-                                title="Node Monitoring (생성 순) - Error",
-                                status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
-                                command=full_cmd,
+                                title="Node Monitoring (생성 순) - Timeout",
+                                status="warning",
+                                body=message,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
+                                command_descriptor,
+                                Panel(message, title="경고", style="bold yellow"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except ApiException as exc:
+                        status = getattr(exc, "status", "unknown")
+                        reason = getattr(exc, "reason", "")
+                        detail = getattr(exc, "body", "") or str(exc)
+                        message = (
+                            f"노드 목록을 조회하는 중 API 오류가 발생했습니다. "
+                            f"(HTTP {status} {reason})"
+                        )
+                        frame_key = _make_frame_key(
+                            "api_error", str(status), reason, detail
+                        )
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Node Monitoring (생성 순) - Error",
+                                status="error",
+                                body=f"{message}\n세부 정보: {detail}",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
+                        message = f"노드 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
+                        frame_key = _make_frame_key("unexpected_error", str(exc))
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Node Monitoring (생성 순) - Error",
+                                status="error",
+                                body=message,
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+
+                    if filter_nodegroup:
+                        filtered_nodes = []
+                        for node in nodes:
+                            labels = (
+                                getattr(getattr(node, "metadata", None), "labels", None)
+                                or {}
+                            )
+                            if labels.get(NODE_GROUP_LABEL) == filter_nodegroup:
+                                filtered_nodes.append(node)
+                        nodes = filtered_nodes
+
+                    if not nodes:
+                        frame_key = _make_frame_key("empty")
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Node Monitoring (생성 순) - Empty",
+                                status="empty",
+                                body="표시할 노드가 없습니다.",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
                                 Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
-                                    style="bold red",
+                                    "표시할 노드가 없습니다.",
+                                    title="정보",
+                                    style="bold yellow",
                                 ),
                             ),
                             snapshot,
@@ -1392,56 +2147,87 @@ def watch_node_monitoring_by_creation() -> None:
                         )
                         tracker.tick()
                         continue
-                    else:
-                        output = stdout.rstrip()
-                        if not output:
-                            frame_key = _make_frame_key("empty")
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Node Monitoring (생성 순) - Empty",
-                                    status="empty",
-                                    body="표시할 노드가 없습니다.",
-                                    command=full_cmd,
-                                )
+
+                    sorted_nodes = sorted(
+                        nodes,
+                        key=lambda node: _ensure_datetime(
+                            getattr(
+                                getattr(node, "metadata", None),
+                                "creation_timestamp",
+                                None,
                             )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        "표시할 노드가 없습니다.",
-                                        title="정보",
-                                        style="bold yellow",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
-                            tracker.tick()
-                            continue
-                        else:
-                            frame_key = _make_frame_key("data", output)
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Node Monitoring (생성 순)",
-                                    status="success",
-                                    body=output,
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        output,
-                                        title="Result",
-                                        border_style="green",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
+                        )
+                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                    )
+                    selected = sorted_nodes[-tail_limit:]
+
+                    table = Table(
+                        show_header=True, header_style="bold magenta", box=box.ROUNDED
+                    )
+                    table.add_column("Name", style="bold green", overflow="fold")
+                    table.add_column("Status")
+                    table.add_column("Roles")
+                    table.add_column("NodeGroup", overflow="fold")
+                    table.add_column("Zone")
+                    table.add_column("Version")
+                    table.add_column("CreatedAt")
+
+                    markdown_rows: List[List[str]] = []
+                    frame_parts: List[str] = []
+                    for node in selected:
+                        metadata = getattr(node, "metadata", None)
+                        status = getattr(node, "status", None)
+                        node_info = getattr(status, "node_info", None)
+
+                        name = getattr(metadata, "name", "-") or "-"
+                        ready_state = _node_ready_condition(node)
+                        roles = _node_roles(node)
+                        node_group = getattr(
+                            getattr(metadata, "labels", None) or {},
+                            NODE_GROUP_LABEL,
+                            "-",
+                        )
+                        zone = _node_zone(node)
+                        version = getattr(node_info, "kubelet_version", "") or "-"
+                        created_at = _format_timestamp(
+                            getattr(metadata, "creation_timestamp", None)
+                        )
+
+                        row = [
+                            name,
+                            ready_state,
+                            roles,
+                            node_group,
+                            zone,
+                            version,
+                            created_at,
+                        ]
+                        table.add_row(*row)
+                        markdown_rows.append(row.copy())
+                        frame_parts.append("|".join(row))
+
+                    frame_key = _make_frame_key("data", *frame_parts)
+                    snapshot = _format_table_snapshot(
+                        title="Node Monitoring (생성 순)",
+                        headers=[
+                            "Name",
+                            "Status",
+                            "Roles",
+                            "NodeGroup",
+                            "Zone",
+                            "Version",
+                            "CreatedAt",
+                        ],
+                        rows=markdown_rows,
+                        command=command_descriptor,
+                        status="success",
+                    )
+                    tracker.update(
+                        frame_key,
+                        _compose_group(command_descriptor, table),
+                        snapshot,
+                        input_state=CURRENT_INPUT_DISPLAY,
+                    )
                     tracker.tick()
     except KeyboardInterrupt:
         console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
@@ -1462,23 +2248,16 @@ def watch_unhealthy_nodes() -> None:
         filter_nodegroup = choose_node_group() or ""
     else:
         filter_nodegroup = ""
-    tail_num = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_limit = _parse_tail_count(tail_num_raw)
 
-    # label selector를 사용해서 정확한 노드 그룹으로 필터링
+    load_kube_config()
+    v1 = client.CoreV1Api()
+    command_descriptor = "Python client: CoreV1Api.list_node (exclude Ready)"
     if filter_nodegroup:
-        base_cmd = (
-            f"kubectl get nodes -l {NODE_GROUP_LABEL}={filter_nodegroup} "
-            f"-L topology.ebs.csi.aws.com/zone -L {NODE_GROUP_LABEL} "
-            "--sort-by=.metadata.creationTimestamp"
+        command_descriptor = (
+            f"{command_descriptor} (filter {NODE_GROUP_LABEL}={filter_nodegroup})"
         )
-    else:
-        base_cmd = (
-            "kubectl get nodes "
-            "-L topology.ebs.csi.aws.com/zone -L {label} "
-            "--sort-by=.metadata.creationTimestamp"
-        ).format(label=NODE_GROUP_LABEL)
-
-    full_cmd = f"{base_cmd} | grep -ivE ' Ready ' | tail -n {tail_num}"
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1486,25 +2265,124 @@ def watch_unhealthy_nodes() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    stdout, error = _run_shell_command(full_cmd)
-                    if error:
-                        frame_key = ("error", (error,))
+                    try:
+                        response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
+                        nodes = list(getattr(response, "items", []) or [])
+                    except (
+                        MaxRetryError,
+                        ConnectTimeoutError,
+                        ReadTimeoutError,
+                        socket.timeout,
+                    ) as exc:
+                        message = (
+                            "노드 정보를 가져오는 중 API 응답이 지연되었습니다. "
+                            "네트워크 연결과 인증 상태를 확인하세요."
+                        )
+                        frame_key = _make_frame_key("timeout", str(exc))
                         snapshot = _format_plain_snapshot(
                             SnapshotPayload(
-                                title="Unhealthy Node - Error",
-                                status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
-                                command=full_cmd,
+                                title="Unhealthy Node - Timeout",
+                                status="warning",
+                                body=message,
+                                command=command_descriptor,
                             )
                         )
                         tracker.update(
                             frame_key,
                             _compose_group(
-                                full_cmd,
+                                command_descriptor,
+                                Panel(message, title="경고", style="bold yellow"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except ApiException as exc:
+                        status = getattr(exc, "status", "unknown")
+                        reason = getattr(exc, "reason", "")
+                        detail = getattr(exc, "body", "") or str(exc)
+                        message = (
+                            f"노드 목록을 조회하는 중 API 오류가 발생했습니다. "
+                            f"(HTTP {status} {reason})"
+                        )
+                        frame_key = _make_frame_key(
+                            "api_error", str(status), reason, detail
+                        )
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Unhealthy Node - Error",
+                                status="error",
+                                body=f"{message}\n세부 정보: {detail}",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
+                        message = f"노드 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
+                        frame_key = _make_frame_key("unexpected_error", str(exc))
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Unhealthy Node - Error",
+                                status="error",
+                                body=message,
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
+                                Panel(message, title="오류", style="bold red"),
+                            ),
+                            snapshot,
+                            input_state=CURRENT_INPUT_DISPLAY,
+                        )
+                        tracker.tick()
+                        continue
+
+                    if filter_nodegroup:
+                        filtered_nodes = []
+                        for node in nodes:
+                            labels = (
+                                getattr(getattr(node, "metadata", None), "labels", None)
+                                or {}
+                            )
+                            if labels.get(NODE_GROUP_LABEL) == filter_nodegroup:
+                                filtered_nodes.append(node)
+                        nodes = filtered_nodes
+
+                    unhealthy = [
+                        node for node in nodes if _node_ready_condition(node) != "Ready"
+                    ]
+                    if not unhealthy:
+                        frame_key = _make_frame_key("empty")
+                        snapshot = _format_plain_snapshot(
+                            SnapshotPayload(
+                                title="Unhealthy Node - Empty",
+                                status="empty",
+                                body="Unhealthy 노드가 없습니다.",
+                                command=command_descriptor,
+                            )
+                        )
+                        tracker.update(
+                            frame_key,
+                            _compose_group(
+                                command_descriptor,
                                 Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
-                                    style="bold red",
+                                    "Unhealthy 노드가 없습니다.",
+                                    title="정보",
+                                    style="bold yellow",
                                 ),
                             ),
                             snapshot,
@@ -1512,56 +2390,88 @@ def watch_unhealthy_nodes() -> None:
                         )
                         tracker.tick()
                         continue
-                    else:
-                        output = stdout.rstrip()
-                        if not output:
-                            frame_key = ("empty", ("",))
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Unhealthy Node - Empty",
-                                    status="empty",
-                                    body="Unhealthy 노드가 없습니다.",
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        "Unhealthy 노드가 없습니다.",
-                                        title="정보",
-                                        style="bold yellow",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
-                            tracker.tick()
-                            continue
-                        else:
-                            frame_key = ("data", (output,))
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Unhealthy Node",
-                                    status="warning",
-                                    body=output,
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        output,
-                                        title="Result",
-                                        border_style="green",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
-                            )
+
+                    sorted_nodes = sorted(
+                        unhealthy,
+                        key=lambda node: getattr(
+                            getattr(node, "metadata", None), "name", ""
+                        )
+                        or "",
+                    )
+                    selected = sorted_nodes[-tail_limit:]
+
+                    table = Table(
+                        show_header=True, header_style="bold magenta", box=box.ROUNDED
+                    )
+                    table.add_column("Name", style="bold green", overflow="fold")
+                    table.add_column("Status")
+                    table.add_column("Reason")
+                    table.add_column("NodeGroup", overflow="fold")
+                    table.add_column("Zone")
+                    table.add_column("Version")
+                    table.add_column("CreatedAt")
+
+                    markdown_rows: List[List[str]] = []
+                    frame_parts: List[str] = []
+                    for node in selected:
+                        metadata = getattr(node, "metadata", None)
+                        status = getattr(node, "status", None)
+                        node_info = getattr(status, "node_info", None)
+
+                        name = getattr(metadata, "name", "-") or "-"
+                        ready_state = _node_ready_condition(node)
+                        reason = "-"
+                        conditions = getattr(status, "conditions", None) or []
+                        for condition in conditions:
+                            if getattr(condition, "type", "") == "Ready":
+                                reason = getattr(condition, "reason", "") or "-"
+                                break
+                        node_group = getattr(
+                            getattr(metadata, "labels", None) or {},
+                            NODE_GROUP_LABEL,
+                            "-",
+                        )
+                        zone = _node_zone(node)
+                        version = getattr(node_info, "kubelet_version", "") or "-"
+                        created_at = _format_timestamp(
+                            getattr(metadata, "creation_timestamp", None)
+                        )
+
+                        row = [
+                            name,
+                            ready_state,
+                            reason,
+                            node_group,
+                            zone,
+                            version,
+                            created_at,
+                        ]
+                        table.add_row(*row)
+                        markdown_rows.append(row.copy())
+                        frame_parts.append("|".join(row))
+
+                    frame_key = _make_frame_key("data", *frame_parts)
+                    snapshot = _format_table_snapshot(
+                        title="Unhealthy Node",
+                        headers=[
+                            "Name",
+                            "Status",
+                            "Reason",
+                            "NodeGroup",
+                            "Zone",
+                            "Version",
+                            "CreatedAt",
+                        ],
+                        rows=markdown_rows,
+                        command=command_descriptor,
+                        status="warning",
+                    )
+                    tracker.update(
+                        frame_key,
+                        _compose_group(command_descriptor, table),
+                        snapshot,
+                        input_state=CURRENT_INPUT_DISPLAY,
+                    )
                     tracker.tick()
     except KeyboardInterrupt:
         console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
@@ -1869,11 +2779,11 @@ def watch_pod_resources() -> None:
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
                     )
-                    table.add_column("Namespace", style="bold green")
-                    table.add_column("Pod")
+                    table.add_column("Namespace", style="bold green", overflow="fold")
+                    table.add_column("Pod", overflow="fold")
                     table.add_column("CPU(cores)")
                     table.add_column("Memory(bytes)")
-                    table.add_column("Node")
+                    table.add_column("Node", overflow="fold")
 
                     markdown_rows = []
                     for row in limited:
