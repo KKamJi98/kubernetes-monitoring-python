@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import csv
 import datetime
 import os
 import shlex
@@ -111,6 +112,7 @@ NODE_GROUP_LABEL = "node.kubernetes.io/app"
 
 SNAPSHOT_EXPORT_DIR = Path("/var/tmp/kmp")
 SNAPSHOT_SAVE_COMMANDS = {"s", ":s", "save", ":save", ":export"}
+CSV_SAVE_COMMANDS = {"csv", ":csv"}
 
 WINDOWS_INPUT_BUFFER: List[str] = []
 POSIX_INPUT_BUFFER: List[str] = []
@@ -368,6 +370,24 @@ def _save_markdown_snapshot(markdown: str) -> Path:
     return file_path
 
 
+def _save_csv_snapshot(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> Path:
+    """CSV 파일을 저장하고 경로 반환."""
+    try:
+        SNAPSHOT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SnapshotSaveError(SNAPSHOT_EXPORT_DIR, exc) from exc
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    file_path = SNAPSHOT_EXPORT_DIR / f"{timestamp}.csv"
+    try:
+        with file_path.open("w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+            writer.writerows(rows)
+    except OSError as exc:
+        raise SnapshotSaveError(file_path, exc) from exc
+    return file_path
+
+
 def _read_nonblocking_command() -> Optional[str]:
     """사용자 입력(line 단위)을 블로킹 없이 읽어 Slack 저장 요청 감지."""
     if not sys.stdin.isatty():
@@ -456,48 +476,83 @@ def _read_nonblocking_command() -> Optional[str]:
     return None
 
 
-def _handle_snapshot_command(
-    live: Live, markdown: Optional[str], command: Optional[str]
-) -> None:
-    """저장 요청이 있는 경우 Markdown을 파일로 기록."""
-    if command is None:
-        return
-    display_command = command.strip() or "<empty>"
-    normalized = command.lower()
-    if normalized not in SNAPSHOT_SAVE_COMMANDS:
+def _handle_csv_save(live: Live, tracker: "LiveFrameTracker", command: str) -> None:
+    """CSV 저장 요청을 처리."""
+    if not tracker.latest_structured_data:
         live.console.print(
-            f"\n입력 '{display_command}' 은(는) 지원하지 않는 명령입니다. "
-            "사용 가능한 입력: s, :s, save, :save, :export",
+            f"\n입력 '{command}' 처리 실패: CSV로 저장할 수 있는 테이블 데이터가 없습니다.",
             style="bold yellow",
         )
         return
-    if not markdown:
-        live.console.print(
-            f"\n입력 '{display_command}' 처리 실패: 저장할 데이터가 없습니다.",
-            style="bold yellow",
-        )
-        return
+
     try:
-        path = _save_markdown_snapshot(markdown)
-    except SnapshotSaveError as exc:
+        headers = tracker.latest_structured_data["headers"]
+        rows = tracker.latest_structured_data["rows"]
+        path = _save_csv_snapshot(headers, rows)
+    except (SnapshotSaveError, KeyError) as exc:
         live.console.print(
-            f"\n입력 '{display_command}' 처리 실패: {exc}",
+            f"\n입력 '{command}' 처리 실패: {exc}",
             style="bold red",
         )
         _clear_input_display()
         return
+
     live.console.print(
-        f"\n입력 '{display_command}' 처리 성공: Slack Markdown 스냅샷 저장 완료 → {path}",
+        f"\n입력 '{command}' 처리 성공: CSV 스냅샷 저장 완료 → {path}",
         style="bold green",
     )
     _clear_input_display()
 
 
-def _tick_iteration(live: Live, markdown: Optional[str]) -> None:
+def _handle_snapshot_command(
+    live: Live, tracker: "LiveFrameTracker", command: Optional[str]
+) -> None:
+    """저장 요청이 있는 경우 Markdown 또는 CSV를 파일로 기록."""
+    if command is None:
+        return
+
+    display_command = command.strip() or "<empty>"
+    normalized = command.lower()
+
+    if normalized in CSV_SAVE_COMMANDS:
+        _handle_csv_save(live, tracker, display_command)
+        return
+
+    if normalized in SNAPSHOT_SAVE_COMMANDS:
+        if not tracker.latest_snapshot:
+            live.console.print(
+                f"\n입력 '{display_command}' 처리 실패: 저장할 데이터가 없습니다.",
+                style="bold yellow",
+            )
+            return
+        try:
+            path = _save_markdown_snapshot(tracker.latest_snapshot)
+        except SnapshotSaveError as exc:
+            live.console.print(
+                f"\n입력 '{display_command}' 처리 실패: {exc}",
+                style="bold red",
+            )
+            _clear_input_display()
+            return
+        live.console.print(
+            f"\n입력 '{display_command}' 처리 성공: Slack Markdown 스냅샷 저장 완료 → {path}",
+            style="bold green",
+        )
+        _clear_input_display()
+        return
+
+    live.console.print(
+        f"\n입력 '{display_command}' 은(는) 지원하지 않는 명령입니다. "
+        "사용 가능한 입력: s, save, csv, ...",
+        style="bold yellow",
+    )
+
+
+def _tick_iteration(live: Live, tracker: "LiveFrameTracker") -> None:
     """루프 종료 전 저장 요청을 처리."""
     user_command = _read_nonblocking_command()
     if user_command:
-        _handle_snapshot_command(live, markdown, user_command)
+        _handle_snapshot_command(live, tracker, user_command)
 
 
 class LiveFrameTracker:
@@ -522,6 +577,7 @@ class LiveFrameTracker:
             "footer": None,
         }
         self.latest_snapshot: Optional[str] = None
+        self.latest_structured_data: Optional[Dict[str, Any]] = None
         self.last_input_state: str = ""
         self.live.update(self.layout)
 
@@ -549,6 +605,7 @@ class LiveFrameTracker:
         frame_key: FrameKey,
         renderable: RenderableType,
         snapshot_markdown: Optional[str],
+        structured_data: Optional[Dict[str, Any]] = None,
         input_state: Optional[str] = None,
     ) -> None:
         current_input_state = (
@@ -591,6 +648,10 @@ class LiveFrameTracker:
             self.live.refresh()
         if snapshot_markdown is not None:
             self.latest_snapshot = snapshot_markdown
+        if structured_data is not None:
+            self.latest_structured_data = structured_data
+        else:
+            self.latest_structured_data = None
 
     def tick(self, interval: float = LIVE_REFRESH_INTERVAL) -> None:
         global TERMINAL_RESIZED
@@ -600,7 +661,7 @@ class LiveFrameTracker:
                 TERMINAL_RESIZED = False
                 self.live.refresh()
 
-            _tick_iteration(self.live, self.latest_snapshot)
+            _tick_iteration(self.live, self)
             if self._sync_input_panel(CURRENT_INPUT_DISPLAY):
                 self.live.refresh()
             remaining = deadline - time.monotonic()
@@ -1345,10 +1406,22 @@ def watch_event_monitoring() -> None:
                         command=command_descriptor,
                         status="success",
                     )
+                    structured_data = {
+                        "headers": [
+                            "Namespace",
+                            "LastSeen",
+                            "Type",
+                            "Reason",
+                            "Object",
+                            "Message",
+                        ],
+                        "rows": markdown_rows,
+                    }
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()
@@ -1705,10 +1778,12 @@ def watch_pod_monitoring_by_creation() -> None:
                         command=command_descriptor,
                         status="success",
                     )
+                    structured_data = {"headers": headers, "rows": markdown_rows}
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()
@@ -1983,10 +2058,12 @@ def watch_non_running_pod() -> None:
                         command=command_descriptor,
                         status="success",
                     )
+                    structured_data = {"headers": headers, "rows": markdown_rows}
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()
@@ -2301,10 +2378,23 @@ def watch_node_monitoring_by_creation() -> None:
                         command=command_descriptor,
                         status="success",
                     )
+                    structured_data = {
+                        "headers": [
+                            "Name",
+                            "Status",
+                            "Roles",
+                            "NodeGroup",
+                            "Zone",
+                            "Version",
+                            "CreatedAt",
+                        ],
+                        "rows": markdown_rows,
+                    }
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()
@@ -2546,10 +2636,23 @@ def watch_unhealthy_nodes() -> None:
                         command=command_descriptor,
                         status="warning",
                     )
+                    structured_data = {
+                        "headers": [
+                            "Name",
+                            "Status",
+                            "Reason",
+                            "NodeGroup",
+                            "Zone",
+                            "Version",
+                            "CreatedAt",
+                        ],
+                        "rows": markdown_rows,
+                    }
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()
@@ -2914,10 +3017,21 @@ def watch_pod_resources() -> None:
                         command=kubectl_cmd,
                         status="success",
                     )
+                    structured_data = {
+                        "headers": [
+                            "Namespace",
+                            "Pod",
+                            "CPU(cores)",
+                            "Memory(bytes)",
+                            "Node",
+                        ],
+                        "rows": markdown_rows,
+                    }
                     tracker.update(
                         frame_key,
                         _compose_group(kubectl_cmd, header, table),
                         snapshot,
+                        structured_data=structured_data,
                         input_state=CURRENT_INPUT_DISPLAY,
                     )
                     tracker.tick()

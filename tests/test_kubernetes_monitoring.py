@@ -172,7 +172,12 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     kubernetes_monitoring._clear_input_display()
     invalid_console = Console(record=True)
     invalid_live = _DummyLive(invalid_console)
-    kubernetes_monitoring._handle_snapshot_command(invalid_live, "data", "invalid")
+    mock_tracker = MagicMock()
+    mock_tracker.latest_snapshot = None
+    mock_tracker.latest_structured_data = None
+    kubernetes_monitoring._handle_snapshot_command(
+        invalid_live, mock_tracker, "invalid"
+    )
     text_output = invalid_console.export_text()
     assert "입력 'invalid' 은(는) 지원하지 않는 명령입니다." in text_output
 
@@ -189,9 +194,11 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
         fake_save_with_path,
         raising=False,
     )
-    kubernetes_monitoring._handle_snapshot_command(success_live, "data", ":save")
+    mock_tracker.latest_snapshot = "some data"
+    kubernetes_monitoring._handle_snapshot_command(success_live, mock_tracker, ":save")
     text_output = success_console.export_text()
     assert "입력 ':save' 처리 성공" in text_output
+
     assert "Slack Markdown 스냅샷 저장 완료" in text_output
     assert str(saved_path) in text_output
 
