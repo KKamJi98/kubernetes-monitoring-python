@@ -773,7 +773,7 @@ class _FrameRenderable:
         self.command = command
         self.body_renderables: List[RenderableType] = list(renderables)
         self._input_panel = _CommandInputPanel()
-        self._footer_panel = _command_panel(command)
+        self._footer_panel: Optional[RenderableType] = None
 
     def __rich_console__(self, console: Console, options):  # type: ignore[override]
         yield self._input_panel
@@ -786,7 +786,7 @@ class _FrameRenderable:
         return self._input_panel
 
     @property
-    def footer_panel(self) -> RenderableType:
+    def footer_panel(self) -> Optional[RenderableType]:
         return self._footer_panel
 
 

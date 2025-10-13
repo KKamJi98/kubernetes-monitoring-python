@@ -214,7 +214,7 @@ def test_live_frame_tracker_updates_sections():
         tracker.update(frame_key, renderable, snapshot_markdown=None, input_state="")
         assert tracker.section_frames["input"] == ("input", ("hidden", ""))
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] == ("footer", ("cmd-1",))
+        assert tracker.section_frames["footer"] is None
 
         renderable_updated = kubernetes_monitoring._compose_group(
             "cmd-2", Text("body-1")
@@ -223,4 +223,4 @@ def test_live_frame_tracker_updates_sections():
             frame_key, renderable_updated, snapshot_markdown=None, input_state=""
         )
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] == ("footer", ("cmd-2",))
+        assert tracker.section_frames["footer"] is None
