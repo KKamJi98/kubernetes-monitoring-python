@@ -119,7 +119,9 @@ class SnapshotPayload:
     command: Optional[str]
 
 
-def _log_k8s_error(category: str, header: str, guidance: str, detail: Exception) -> None:
+def _log_k8s_error(
+    category: str, header: str, guidance: str, detail: Exception
+) -> None:
     """Kubernetes API 오류 메시지를 한 번만 출력."""
     signature = f"{category}:{type(detail).__name__}:{detail}"
     if signature in _API_ERROR_SIGNATURES:
