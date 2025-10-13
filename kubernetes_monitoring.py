@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -26,11 +27,13 @@ from typing import (
 try:
     from kubernetes import client, config
     from kubernetes.client import CoreV1Api, V1NamespaceList, V1Pod
+    from kubernetes.client.exceptions import ApiException
 except ImportError:
     client = None  # type: ignore
     config = None  # type: ignore
     CoreV1Api = None  # type: ignore
     V1Pod = None  # type: ignore
+    ApiException = Exception  # type: ignore[assignment]
 from rich import box
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
@@ -38,6 +41,11 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
+
+try:
+    from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ReadTimeoutError
+except ImportError:
+    ConnectTimeoutError = MaxRetryError = ReadTimeoutError = Exception  # type: ignore
 
 console = Console()
 
@@ -56,6 +64,9 @@ INPUT_POLL_INTERVAL = 0.05  # seconds
 COMMAND_INPUT_VISIBLE = False
 
 FrameKey = Tuple[str, Tuple[str, ...]]
+
+API_REQUEST_TIMEOUT = 10.0
+_API_ERROR_SIGNATURES: Set[str] = set()
 
 if TYPE_CHECKING:
 
@@ -106,6 +117,18 @@ class SnapshotPayload:
     status: str
     body: str
     command: Optional[str]
+
+
+def _log_k8s_error(category: str, header: str, guidance: str, detail: Exception) -> None:
+    """Kubernetes API 오류 메시지를 한 번만 출력."""
+    signature = f"{category}:{type(detail).__name__}:{detail}"
+    if signature in _API_ERROR_SIGNATURES:
+        return
+    _API_ERROR_SIGNATURES.add(signature)
+    console.print(f"\n[bold red]{header}[/bold red]")
+    if guidance:
+        console.print(guidance, style="bold yellow")
+    console.print(f"(세부 정보: {detail})", style="dim")
 
 
 def _status_icon(status: str) -> Optional[str]:
@@ -668,8 +691,32 @@ def choose_namespace() -> Optional[str]:
     load_kube_config()
     v1 = client.CoreV1Api()
     try:
-        ns_list: V1NamespaceList = v1.list_namespace()
+        ns_list: V1NamespaceList = v1.list_namespace(
+            _request_timeout=API_REQUEST_TIMEOUT
+        )
         items = ns_list.items
+    except (MaxRetryError, ConnectTimeoutError, ReadTimeoutError, socket.timeout) as e:
+        _log_k8s_error(
+            "namespace-timeout",
+            "Kubernetes API 응답이 지연되어 namespace 목록을 조회하지 못했습니다.",
+            "인증/네트워크 상태를 확인한 뒤 `kubectl get ns`로 액세스를 먼저 검증해주세요.",
+            e,
+        )
+        return None
+    except ApiException as e:
+        status = getattr(e, "status", "unknown")
+        reason = getattr(e, "reason", "unknown")
+        guidance = (
+            f"status={status} reason={reason}. "
+            "`kubectl config view`로 context를 확인하고 자격 증명을 갱신해주세요."
+        )
+        _log_k8s_error(
+            "namespace-api",
+            "Namespace 조회 중 API 오류가 발생했습니다.",
+            guidance,
+            e,
+        )
+        return None
     except Exception as e:
         print(f"Error fetching namespaces: {e}")
         return None
@@ -766,9 +813,40 @@ def get_pods(v1_api: CoreV1Api, namespace: Optional[str] = None) -> List[V1Pod]:
     """
     try:
         if namespace:
-            return list(v1_api.list_namespaced_pod(namespace=namespace).items)
+            return list(
+                v1_api.list_namespaced_pod(
+                    namespace=namespace, _request_timeout=API_REQUEST_TIMEOUT
+                ).items
+            )
         else:
-            return list(v1_api.list_pod_for_all_namespaces().items)
+            return list(
+                v1_api.list_pod_for_all_namespaces(
+                    _request_timeout=API_REQUEST_TIMEOUT
+                ).items
+            )
+    except (MaxRetryError, ConnectTimeoutError, ReadTimeoutError, socket.timeout) as e:
+        _log_k8s_error(
+            "pod-timeout",
+            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다.",
+            "VPN, 사설망 연결, 인증 세션(AWS SSO / Azure / GCP 등)을 다시 확인하세요.",
+            e,
+        )
+        return []
+    except ApiException as e:
+        status = getattr(e, "status", "unknown")
+        reason = getattr(e, "reason", "unknown")
+        guidance = (
+            f"status={status} reason={reason}. "
+            "자격 증명을 재갱신 후 다시 실행하거나 "
+            "`kubectl get pods`로 접근 가능 여부를 확인하세요."
+        )
+        _log_k8s_error(
+            "pod-api",
+            "Pod 조회 중 API 오류가 발생했습니다.",
+            guidance,
+            e,
+        )
+        return []
     except Exception as e:
         print(f"Error fetching pods: {e}")
         return []
