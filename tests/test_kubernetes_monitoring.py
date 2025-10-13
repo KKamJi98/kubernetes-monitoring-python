@@ -1,7 +1,7 @@
 import os
 import sys
-from functools import partial
 from pathlib import Path
+from typing import Dict, Optional, Sequence
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,6 +38,13 @@ def test_parse_memory_to_bytes():
     assert kubernetes_monitoring._parse_memory_to_bytes("2Gi") == 2 * 1024**3
     assert kubernetes_monitoring._parse_memory_to_bytes("1000") == 1000
     assert kubernetes_monitoring._parse_memory_to_bytes("unknown") == 0
+
+
+def test_format_ready_ratio():
+    """Ready/Total 표기를 Excel-safe brackets로 출력한다."""
+    assert kubernetes_monitoring._format_ready_ratio(1, 1) == "[1/1]"
+    assert kubernetes_monitoring._format_ready_ratio(0, 0) == "[0/0]"
+    assert kubernetes_monitoring._format_ready_ratio(3, 2) == "[2/2]"
 
 
 @patch("kubernetes_monitoring.subprocess.run")
@@ -138,7 +145,7 @@ def test_choose_namespace_failure(mock_client):
 
 
 def test_save_markdown_snapshot_success(tmp_path, monkeypatch):
-    """Slack 스냅샷 저장 성공 시 tmp 경로에 파일 생성."""
+    """코드블록 스냅샷 저장 성공 시 tmp 경로에 파일 생성."""
     monkeypatch.setattr(kubernetes_monitoring, "SNAPSHOT_EXPORT_DIR", tmp_path)
     path = kubernetes_monitoring._save_markdown_snapshot("hello world")
     assert path.parent == tmp_path
@@ -157,14 +164,26 @@ def test_save_markdown_snapshot_permission_error(monkeypatch):
         kubernetes_monitoring._save_markdown_snapshot("data")
 
 
+def test_format_table_snapshot_uses_code_block():
+    """테이블 스냅샷이 코드블록 형태로 출력되는지 확인."""
+    snapshot = kubernetes_monitoring._format_table_snapshot(
+        title="Sample",
+        headers=["A", "B"],
+        rows=[["1", "2"]],
+        command="kubectl get pods",
+        status="success",
+    )
+    assert snapshot.startswith("```text")
+    assert "| ---" not in snapshot
+    assert "| A |" not in snapshot
+    assert "Status: SUCCESS" in snapshot
+    assert "$ kubectl get pods" in snapshot
+    assert snapshot.endswith("```")
+
+
 class _DummyLive:
     def __init__(self, console: Console) -> None:
         self.console = console
-
-
-def _helper_fake_save(path: Path, markdown: str) -> Path:
-    path.write_text(markdown)
-    return path
 
 
 def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
@@ -185,22 +204,60 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     success_console = Console(record=True)
     success_live = _DummyLive(success_console)
 
-    saved_path = tmp_path / "snapshot.md"
-    fake_save_with_path = partial(_helper_fake_save, saved_path)
+    monkeypatch.setattr(
+        kubernetes_monitoring,
+        "SNAPSHOT_EXPORT_DIR",
+        tmp_path,
+        raising=False,
+    )
+
+    captured_timestamps: Dict[str, Optional[str]] = {}
+
+    def fake_save_markdown(markdown: str, timestamp: Optional[str] = None) -> Path:
+        captured_timestamps["markdown"] = timestamp
+        name = f"{timestamp or 'md-fallback'}.md"
+        target = tmp_path / name
+        target.write_text(markdown, encoding="utf-8")
+        return target
+
+    def fake_save_csv(
+        headers: Sequence[str],
+        rows: Sequence[Sequence[str]],
+        timestamp: Optional[str] = None,
+    ) -> Path:
+        captured_timestamps["csv"] = timestamp
+        name = f"{timestamp or 'csv-fallback'}.csv"
+        target = tmp_path / name
+        with target.open("w", encoding="utf-8") as handle:
+            handle.write(",".join(headers) + "\n")
+            for row in rows:
+                handle.write(",".join(row) + "\n")
+        return target
 
     monkeypatch.setattr(
         kubernetes_monitoring,
         "_save_markdown_snapshot",
-        fake_save_with_path,
+        fake_save_markdown,
         raising=False,
     )
+    monkeypatch.setattr(
+        kubernetes_monitoring,
+        "_save_csv_snapshot",
+        fake_save_csv,
+        raising=False,
+    )
+
     mock_tracker.latest_snapshot = "some data"
+    mock_tracker.latest_structured_data = {
+        "headers": ["foo"],
+        "rows": [["bar"]],
+    }
     kubernetes_monitoring._handle_snapshot_command(success_live, mock_tracker, ":save")
     text_output = success_console.export_text()
     assert "입력 ':save' 처리 성공" in text_output
-
-    assert "Slack Markdown 스냅샷 저장 완료" in text_output
-    assert str(saved_path) in text_output
+    assert "스냅샷 저장 완료" in text_output
+    assert "(CSV:" in text_output
+    assert captured_timestamps["markdown"] == captured_timestamps["csv"]
 
 
 def test_live_frame_tracker_updates_sections():
@@ -214,7 +271,7 @@ def test_live_frame_tracker_updates_sections():
         tracker.update(frame_key, renderable, snapshot_markdown=None, input_state="")
         assert tracker.section_frames["input"] == ("input", ("hidden", ""))
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] is None
+        assert tracker.section_frames["footer"] == ("footer", ("cmd-1",))
 
         renderable_updated = kubernetes_monitoring._compose_group(
             "cmd-2", Text("body-1")
@@ -223,4 +280,4 @@ def test_live_frame_tracker_updates_sections():
             frame_key, renderable_updated, snapshot_markdown=None, input_state=""
         )
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] is None
+        assert tracker.section_frames["footer"] == ("footer", ("cmd-2",))

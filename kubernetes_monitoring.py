@@ -330,39 +330,88 @@ def _format_table_snapshot(
     command: str,
     status: str = "info",
 ) -> str:
-    """테이블 데이터를 Slack Markdown 표로 변환."""
-    sanitized_headers = [header.strip() for header in headers]
-    sanitized_rows: List[str] = []
+    """테이블 데이터를 현재 화면과 유사한 텍스트 코드블록으로 변환."""
+    sanitized_headers = [str(header).strip() for header in headers]
+    column_count = len(sanitized_headers)
+
+    sanitized_rows: List[List[str]] = []
     for row in rows:
-        sanitized_cells = []
-        for cell in row:
-            sanitized_cells.append(str(cell).replace("\n", " ").strip())
-        sanitized_rows.append("| " + " | ".join(sanitized_cells) + " |")
+        normalized = [
+            str(cell).replace("\n", " ").strip() for cell in row[:column_count]
+        ]
+        if len(normalized) < column_count:
+            normalized.extend([""] * (column_count - len(normalized)))
+        sanitized_rows.append(normalized)
+
+    table_lines: List[str] = []
+
+    if column_count == 0:
+        table_lines.append("(no columns)")
+    else:
+        column_widths: List[int] = []
+        for idx in range(column_count):
+            max_width = len(sanitized_headers[idx])
+            for row in sanitized_rows:
+                if idx < len(row):
+                    max_width = max(max_width, len(row[idx]))
+            column_widths.append(max_width)
+
+        def _format_row(cells: Sequence[str]) -> str:
+            padded: List[str] = []
+            for idx in range(column_count):
+                cell = cells[idx] if idx < len(cells) else ""
+                width = column_widths[idx]
+                padded.append(cell.ljust(width))
+            return "  ".join(padded).rstrip()
+
+        header_line = _format_row(sanitized_headers)
+        divider = "  ".join(
+            ("-" * width) if width > 0 else "-" for width in column_widths
+        ).rstrip()
+
+        table_lines.append(header_line)
+        table_lines.append(divider)
+        if sanitized_rows:
+            table_lines.extend(_format_row(row) for row in sanitized_rows)
+        else:
+            table_lines.append("(no rows)")
 
     icon = _status_icon(status)
-    title_line = f"*{title.strip()}*"
-    if icon:
-        title_line = f"*{icon} {title.strip()}*"
+    title_text = title.strip() or "Snapshot"
+    title_line = f"{icon} {title_text}" if icon else title_text
+    status_text = status.strip().upper() or "INFO"
 
-    contents = [
-        title_line,
-        "| " + " | ".join(sanitized_headers) + " |",
-        "| " + " | ".join(["---"] * len(sanitized_headers)) + " |",
-        *sanitized_rows,
+    command_lines = [
+        line.rstrip() for line in command.strip().splitlines() if line.strip()
     ]
-    contents.append("*Command*")
-    contents.extend(["```", command.strip(), "```"])
-    return "\n".join(contents)
+    if not command_lines:
+        command_lines = ["(no command)"]
+
+    snapshot_lines: List[str] = [
+        title_line,
+        f"Status: {status_text}",
+        "",
+        *table_lines,
+        "",
+        "Command:",
+        *(f"$ {line}" for line in command_lines),
+    ]
+    return "\n".join(["```text", *snapshot_lines, "```"])
 
 
-def _save_markdown_snapshot(markdown: str) -> Path:
-    """슬랙 공유용 Markdown 파일을 저장하고 경로 반환."""
+def _generate_snapshot_timestamp() -> str:
+    """스냅샷 파일명에 사용할 타임스탬프 문자열 생성."""
+    return datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+
+
+def _save_markdown_snapshot(markdown: str, timestamp: Optional[str] = None) -> Path:
+    """코드블록 스냅샷 파일을 저장하고 경로 반환."""
     try:
         SNAPSHOT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise SnapshotSaveError(SNAPSHOT_EXPORT_DIR, exc) from exc
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    file_path = SNAPSHOT_EXPORT_DIR / f"{timestamp}.md"
+    snapshot_timestamp = timestamp or _generate_snapshot_timestamp()
+    file_path = SNAPSHOT_EXPORT_DIR / f"{snapshot_timestamp}.md"
     try:
         file_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
     except OSError as exc:
@@ -370,14 +419,18 @@ def _save_markdown_snapshot(markdown: str) -> Path:
     return file_path
 
 
-def _save_csv_snapshot(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> Path:
+def _save_csv_snapshot(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    timestamp: Optional[str] = None,
+) -> Path:
     """CSV 파일을 저장하고 경로 반환."""
     try:
         SNAPSHOT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise SnapshotSaveError(SNAPSHOT_EXPORT_DIR, exc) from exc
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    file_path = SNAPSHOT_EXPORT_DIR / f"{timestamp}.csv"
+    snapshot_timestamp = timestamp or _generate_snapshot_timestamp()
+    file_path = SNAPSHOT_EXPORT_DIR / f"{snapshot_timestamp}.csv"
     try:
         with file_path.open("w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
@@ -386,6 +439,14 @@ def _save_csv_snapshot(headers: Sequence[str], rows: Sequence[Sequence[str]]) ->
     except OSError as exc:
         raise SnapshotSaveError(file_path, exc) from exc
     return file_path
+
+
+def _format_ready_ratio(ready: int, total: int) -> str:
+    """컨테이너 Ready 비율을 Excel-safe한 문자열로 변환."""
+    if total <= 0:
+        return "[0/0]"
+    normalized_ready = max(0, min(ready, total))
+    return f"[{normalized_ready}/{total}]"
 
 
 def _read_nonblocking_command() -> Optional[str]:
@@ -525,9 +586,29 @@ def _handle_snapshot_command(
                 style="bold yellow",
             )
             return
+        markdown_path: Optional[Path] = None
+        csv_path: Optional[Path] = None
         try:
-            path = _save_markdown_snapshot(tracker.latest_snapshot)
+            timestamp = _generate_snapshot_timestamp()
+            markdown_path = _save_markdown_snapshot(
+                tracker.latest_snapshot,
+                timestamp=timestamp,
+            )
+            structured_data = tracker.latest_structured_data
+            if (
+                structured_data
+                and "headers" in structured_data
+                and "rows" in structured_data
+            ):
+                csv_path = _save_csv_snapshot(
+                    structured_data["headers"],
+                    structured_data["rows"],
+                    timestamp=timestamp,
+                )
         except SnapshotSaveError as exc:
+            with contextlib.suppress(OSError):
+                if markdown_path and markdown_path.exists():
+                    markdown_path.unlink()
             live.console.print(
                 f"\n입력 '{display_command}' 처리 실패: {exc}",
                 style="bold red",
@@ -535,7 +616,15 @@ def _handle_snapshot_command(
             _clear_input_display()
             return
         live.console.print(
-            f"\n입력 '{display_command}' 처리 성공: Slack Markdown 스냅샷 저장 완료 → {path}",
+            "\n입력 '{command}' 처리 성공: 스냅샷 저장 완료 → {markdown}{csv}".format(
+                command=display_command,
+                markdown=markdown_path,
+                csv=(
+                    f" (CSV: {csv_path})"
+                    if csv_path is not None
+                    else " (CSV 데이터 없음)"
+                ),
+            ),
             style="bold green",
         )
         _clear_input_display()
@@ -618,9 +707,11 @@ class LiveFrameTracker:
 
         if isinstance(renderable, _FrameRenderable):
             body_renderable = _merge_renderables(renderable.body_renderables)
-            footer_renderable = renderable.footer_panel
             command_descriptor = renderable.command
             input_renderable = renderable.input_panel
+            footer_renderable = renderable.footer_panel or _command_panel(
+                command_descriptor
+            )
 
         changed = self._sync_input_panel(current_input_state, input_renderable)
 
@@ -734,8 +825,9 @@ def _run_shell_command(command: str) -> Tuple[str, Optional[str]]:
 
 def _command_panel(command: str) -> Panel:
     """공통적으로 사용하는 kubectl 명령 패널 생성."""
+    command_display = command.strip() or "(no command)"
     return Panel(
-        Text(f"$ {command}", style="bold cyan"),
+        Text(f"$ {command_display}", style="bold cyan"),
         title="kubectl command",
         border_style="cyan",
     )
@@ -1712,10 +1804,9 @@ def watch_pod_monitoring_by_creation() -> None:
                             if container_statuses
                             else len(getattr(spec, "containers", []) or [])
                         )
-                        ready_display = (
-                            f"{ready_count}/{total_containers}"
-                            if total_containers
-                            else "0/0"
+                        ready_display = _format_ready_ratio(
+                            ready_count,
+                            total_containers,
                         )
                         restarts = sum(
                             int(getattr(item, "restart_count", 0))
@@ -2000,10 +2091,9 @@ def watch_non_running_pod() -> None:
                             if container_statuses
                             else len(getattr(spec, "containers", []) or [])
                         )
-                        ready_display = (
-                            f"{ready_count}/{total_containers}"
-                            if total_containers
-                            else "0/0"
+                        ready_display = _format_ready_ratio(
+                            ready_count,
+                            total_containers,
                         )
                         restarts = sum(
                             int(getattr(item, "restart_count", 0))

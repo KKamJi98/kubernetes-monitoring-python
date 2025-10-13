@@ -103,6 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Export Live snapshots as code-block markdown alongside same-name CSV files for external sharing.
+- Output container Ready ratios in bracketed form to avoid spreadsheet auto-formatting issues.
+
 ### Changed
 
 - Bump Kubernetes client to v34.1.0 and refresh supporting dependencies (requests 2.32.5, rich 14.1.0, PyYAML 6.0.3).
