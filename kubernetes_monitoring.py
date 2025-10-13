@@ -202,6 +202,22 @@ def _format_timestamp(value: Optional[datetime.datetime]) -> str:
     return normalized.strftime("%Y-%m-%d %H:%M:%S")
 
 
+_TIMEZONE_LABEL = "UTC"
+_TIME_AWARE_HEADERS = {"LastSeen", "CreatedAt", "LastTerminatedTime"}
+
+
+def _label_time_header(header: str) -> str:
+    """시간 관련 컬럼에 타임존 정보를 부착한다."""
+    if header in _TIME_AWARE_HEADERS:
+        return f"{header} ({_TIMEZONE_LABEL})"
+    return header
+
+
+def _label_time_headers(headers: Sequence[str]) -> List[str]:
+    """시간 컬럼이 포함된 헤더 목록에 타임존 레이블을 일괄 적용한다."""
+    return [_label_time_header(name) for name in headers]
+
+
 def _parse_tail_count(raw: str) -> int:
     """tail -n 입력 문자열을 안전한 정수로 변환."""
     try:
@@ -1403,7 +1419,7 @@ def watch_event_monitoring() -> None:
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
                     )
                     table.add_column("Namespace", style="bold green", overflow="fold")
-                    table.add_column("LastSeen")
+                    table.add_column(_label_time_header("LastSeen"))
                     table.add_column("Type")
                     table.add_column("Reason")
                     table.add_column("Object")
@@ -1461,31 +1477,24 @@ def watch_event_monitoring() -> None:
                         )
 
                     frame_key = _make_frame_key("data", *frame_parts)
-                    snapshot = _format_table_snapshot(
-                        title="Event Monitoring",
-                        headers=[
+                    headers = _label_time_headers(
+                        [
                             "Namespace",
                             "LastSeen",
                             "Type",
                             "Reason",
                             "Object",
                             "Message",
-                        ],
+                        ]
+                    )
+                    snapshot = _format_table_snapshot(
+                        title="Event Monitoring",
+                        headers=headers,
                         rows=markdown_rows,
                         command=command_descriptor,
                         status="success",
                     )
-                    structured_data = {
-                        "headers": [
-                            "Namespace",
-                            "LastSeen",
-                            "Type",
-                            "Reason",
-                            "Object",
-                            "Message",
-                        ],
-                        "rows": markdown_rows,
-                    }
+                    structured_data = {"headers": headers, "rows": markdown_rows}
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
@@ -1541,7 +1550,7 @@ def view_restarted_container_logs() -> None:
     table.add_column("Namespace", overflow="fold")
     table.add_column("Pod", overflow="fold")
     table.add_column("Container", overflow="fold")
-    table.add_column("LastTerminatedTime")
+    table.add_column(_label_time_header("LastTerminatedTime"))
     for i, (ns_pod, p_name, c_name, fat) in enumerate(displayed_containers, start=1):
         table.add_row(str(i), ns_pod, p_name, c_name, fat.strftime("%Y-%m-%d %H:%M:%S"))
     console.print(
@@ -1751,7 +1760,7 @@ def watch_pod_monitoring_by_creation() -> None:
                     table.add_column("Ready")
                     table.add_column("Status")
                     table.add_column("Restarts", justify="right")
-                    table.add_column("CreatedAt")
+                    table.add_column(_label_time_header("CreatedAt"))
                     if show_extra:
                         table.add_column("PodIP")
                         table.add_column("Node", overflow="fold")
@@ -1839,6 +1848,7 @@ def watch_pod_monitoring_by_creation() -> None:
                     )
                     if show_extra:
                         headers.extend(["PodIP", "Node"])
+                    headers = _label_time_headers(headers)
                     snapshot = _format_table_snapshot(
                         title="Pod Monitoring (생성 순)",
                         headers=headers,
@@ -2038,7 +2048,7 @@ def watch_non_running_pod() -> None:
                     table.add_column("Phase")
                     table.add_column("Ready")
                     table.add_column("Restarts", justify="right")
-                    table.add_column("CreatedAt")
+                    table.add_column(_label_time_header("CreatedAt"))
                     if show_extra:
                         table.add_column("PodIP")
                         table.add_column("Node", overflow="fold")
@@ -2118,6 +2128,7 @@ def watch_non_running_pod() -> None:
                     )
                     if show_extra:
                         headers.extend(["PodIP", "Node"])
+                    headers = _label_time_headers(headers)
                     snapshot = _format_table_snapshot(
                         title="Non-Running Pod",
                         headers=headers,
@@ -2393,7 +2404,7 @@ def watch_node_monitoring_by_creation() -> None:
                     table.add_column("NodeGroup", overflow="fold")
                     table.add_column("Zone")
                     table.add_column("Version")
-                    table.add_column("CreatedAt")
+                    table.add_column(_label_time_header("CreatedAt"))
 
                     markdown_rows: List[List[str]] = []
                     frame_parts: List[str] = []
@@ -2430,9 +2441,8 @@ def watch_node_monitoring_by_creation() -> None:
                         frame_parts.append("|".join(row))
 
                     frame_key = _make_frame_key("data", *frame_parts)
-                    snapshot = _format_table_snapshot(
-                        title="Node Monitoring (생성 순)",
-                        headers=[
+                    headers = _label_time_headers(
+                        [
                             "Name",
                             "Status",
                             "Roles",
@@ -2440,23 +2450,16 @@ def watch_node_monitoring_by_creation() -> None:
                             "Zone",
                             "Version",
                             "CreatedAt",
-                        ],
+                        ]
+                    )
+                    snapshot = _format_table_snapshot(
+                        title="Node Monitoring (생성 순)",
+                        headers=headers,
                         rows=markdown_rows,
                         command=command_descriptor,
                         status="success",
                     )
-                    structured_data = {
-                        "headers": [
-                            "Name",
-                            "Status",
-                            "Roles",
-                            "NodeGroup",
-                            "Zone",
-                            "Version",
-                            "CreatedAt",
-                        ],
-                        "rows": markdown_rows,
-                    }
+                    structured_data = {"headers": headers, "rows": markdown_rows}
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
@@ -2646,7 +2649,7 @@ def watch_unhealthy_nodes() -> None:
                     table.add_column("NodeGroup", overflow="fold")
                     table.add_column("Zone")
                     table.add_column("Version")
-                    table.add_column("CreatedAt")
+                    table.add_column(_label_time_header("CreatedAt"))
 
                     markdown_rows: List[List[str]] = []
                     frame_parts: List[str] = []
@@ -2688,9 +2691,8 @@ def watch_unhealthy_nodes() -> None:
                         frame_parts.append("|".join(row))
 
                     frame_key = _make_frame_key("data", *frame_parts)
-                    snapshot = _format_table_snapshot(
-                        title="Unhealthy Node",
-                        headers=[
+                    headers = _label_time_headers(
+                        [
                             "Name",
                             "Status",
                             "Reason",
@@ -2698,23 +2700,16 @@ def watch_unhealthy_nodes() -> None:
                             "Zone",
                             "Version",
                             "CreatedAt",
-                        ],
+                        ]
+                    )
+                    snapshot = _format_table_snapshot(
+                        title="Unhealthy Node",
+                        headers=headers,
                         rows=markdown_rows,
                         command=command_descriptor,
                         status="warning",
                     )
-                    structured_data = {
-                        "headers": [
-                            "Name",
-                            "Status",
-                            "Reason",
-                            "NodeGroup",
-                            "Zone",
-                            "Version",
-                            "CreatedAt",
-                        ],
-                        "rows": markdown_rows,
-                    }
+                    structured_data = {"headers": headers, "rows": markdown_rows}
                     tracker.update(
                         frame_key,
                         _compose_group(command_descriptor, table),
