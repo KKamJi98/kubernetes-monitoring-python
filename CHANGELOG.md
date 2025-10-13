@@ -110,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Remove the kubectl command footer from Live views and markdown snapshots to reduce on-screen clutter.
 - Bump Kubernetes client to v34.1.0 and refresh supporting dependencies (requests 2.32.5, rich 14.1.0, PyYAML 6.0.3).
 - Raise the minimum supported Python version to 3.9 and align lint/type-check targets.
 

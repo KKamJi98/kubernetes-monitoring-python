@@ -317,9 +317,6 @@ def _format_plain_snapshot(payload: SnapshotPayload) -> str:
     else:
         lines.extend(["```", "No data available.", "```"])
 
-    if payload.command:
-        lines.append("*Command*")
-        lines.extend(["```", payload.command.strip(), "```"])
     return "\n".join(lines)
 
 
@@ -330,7 +327,10 @@ def _format_table_snapshot(
     command: str,
     status: str = "info",
 ) -> str:
-    """테이블 데이터를 현재 화면과 유사한 텍스트 코드블록으로 변환."""
+    """테이블 데이터를 현재 화면과 유사한 텍스트 코드블록으로 변환.
+
+    `command` 인자는 호환성을 위해 유지하며 렌더링에는 사용하지 않는다.
+    """
     sanitized_headers = [str(header).strip() for header in headers]
     column_count = len(sanitized_headers)
 
@@ -378,25 +378,13 @@ def _format_table_snapshot(
 
     icon = _status_icon(status)
     title_text = title.strip() or "Snapshot"
-    title_line = f"{icon} {title_text}" if icon else title_text
-    status_text = status.strip().upper() or "INFO"
+    if icon:
+        title_line = f"*{icon} {title_text}*"
+    else:
+        title_line = f"*{title_text}*"
 
-    command_lines = [
-        line.rstrip() for line in command.strip().splitlines() if line.strip()
-    ]
-    if not command_lines:
-        command_lines = ["(no command)"]
-
-    snapshot_lines: List[str] = [
-        title_line,
-        f"Status: {status_text}",
-        "",
-        *table_lines,
-        "",
-        "Command:",
-        *(f"$ {line}" for line in command_lines),
-    ]
-    return "\n".join(["```text", *snapshot_lines, "```"])
+    snapshot_lines: List[str] = [title_line, "", "```", *table_lines, "```"]
+    return "\n".join(snapshot_lines)
 
 
 def _generate_snapshot_timestamp() -> str:
@@ -709,9 +697,7 @@ class LiveFrameTracker:
             body_renderable = _merge_renderables(renderable.body_renderables)
             command_descriptor = renderable.command
             input_renderable = renderable.input_panel
-            footer_renderable = renderable.footer_panel or _command_panel(
-                command_descriptor
-            )
+            footer_renderable = renderable.footer_panel
 
         changed = self._sync_input_panel(current_input_state, input_renderable)
 
@@ -823,16 +809,6 @@ def _run_shell_command(command: str) -> Tuple[str, Optional[str]]:
     return completed.stdout, None
 
 
-def _command_panel(command: str) -> Panel:
-    """공통적으로 사용하는 kubectl 명령 패널 생성."""
-    command_display = command.strip() or "(no command)"
-    return Panel(
-        Text(f"$ {command_display}", style="bold cyan"),
-        title="kubectl command",
-        border_style="cyan",
-    )
-
-
 def _merge_renderables(renderables: Sequence[RenderableType]) -> RenderableType:
     """렌더러 목록을 단일 RenderableType으로 축약."""
     if not renderables:
@@ -871,7 +847,8 @@ class _FrameRenderable:
         yield self._input_panel
         for item in self.body_renderables:
             yield item
-        yield self._footer_panel
+        if self._footer_panel is not None:
+            yield self._footer_panel
 
     @property
     def input_panel(self) -> RenderableType:
@@ -883,7 +860,7 @@ class _FrameRenderable:
 
 
 def _compose_group(command: str, *renderables: RenderableType) -> _FrameRenderable:
-    """메인 콘텐츠와 kubectl 명령을 묶어 FrameRenderable 생성."""
+    """메인 콘텐츠와 메타데이터(command)를 함께 추적할 렌더러 생성."""
     return _FrameRenderable(command, *renderables)
 
 

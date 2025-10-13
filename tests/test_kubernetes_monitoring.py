@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -144,7 +144,9 @@ def test_choose_namespace_failure(mock_client):
     kubernetes_monitoring.choose_namespace()
 
 
-def test_save_markdown_snapshot_success(tmp_path, monkeypatch):
+def test_save_markdown_snapshot_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """코드블록 스냅샷 저장 성공 시 tmp 경로에 파일 생성."""
     monkeypatch.setattr(kubernetes_monitoring, "SNAPSHOT_EXPORT_DIR", tmp_path)
     path = kubernetes_monitoring._save_markdown_snapshot("hello world")
@@ -152,7 +154,9 @@ def test_save_markdown_snapshot_success(tmp_path, monkeypatch):
     assert path.read_text(encoding="utf-8") == "hello world\n"
 
 
-def test_save_markdown_snapshot_permission_error(monkeypatch):
+def test_save_markdown_snapshot_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """디렉터리 생성 실패 시 SnapshotSaveError 발생."""
 
     def fail_mkdir(*args, **kwargs):
@@ -164,7 +168,7 @@ def test_save_markdown_snapshot_permission_error(monkeypatch):
         kubernetes_monitoring._save_markdown_snapshot("data")
 
 
-def test_format_table_snapshot_uses_code_block():
+def test_format_table_snapshot_uses_code_block() -> None:
     """테이블 스냅샷이 코드블록 형태로 출력되는지 확인."""
     snapshot = kubernetes_monitoring._format_table_snapshot(
         title="Sample",
@@ -173,12 +177,13 @@ def test_format_table_snapshot_uses_code_block():
         command="kubectl get pods",
         status="success",
     )
-    assert snapshot.startswith("```text")
-    assert "| ---" not in snapshot
-    assert "| A |" not in snapshot
-    assert "Status: SUCCESS" in snapshot
-    assert "$ kubectl get pods" in snapshot
-    assert snapshot.endswith("```")
+    lines = snapshot.splitlines()
+    assert lines[0] == "*:white_check_mark: Sample*"
+    assert lines[1] == ""
+    assert lines[2] == "```"
+    assert "A  B" in lines[3]
+    assert "Command" not in snapshot
+    assert lines[-1] == "```"
 
 
 class _DummyLive:
@@ -186,7 +191,9 @@ class _DummyLive:
         self.console = console
 
 
-def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
+def test_handle_snapshot_command_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """저장 명령 처리 시 사용자 입력을 메시지에 포함한다."""
     kubernetes_monitoring._clear_input_display()
     invalid_console = Console(record=True)
@@ -195,7 +202,7 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     mock_tracker.latest_snapshot = None
     mock_tracker.latest_structured_data = None
     kubernetes_monitoring._handle_snapshot_command(
-        invalid_live, mock_tracker, "invalid"
+        cast(Live, invalid_live), mock_tracker, "invalid"
     )
     text_output = invalid_console.export_text()
     assert "입력 'invalid' 은(는) 지원하지 않는 명령입니다." in text_output
@@ -212,11 +219,12 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     )
 
     captured_timestamps: Dict[str, Optional[str]] = {}
+    base_dir: Path = tmp_path
 
     def fake_save_markdown(markdown: str, timestamp: Optional[str] = None) -> Path:
         captured_timestamps["markdown"] = timestamp
         name = f"{timestamp or 'md-fallback'}.md"
-        target = tmp_path / name
+        target: Path = base_dir / name
         target.write_text(markdown, encoding="utf-8")
         return target
 
@@ -227,11 +235,11 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     ) -> Path:
         captured_timestamps["csv"] = timestamp
         name = f"{timestamp or 'csv-fallback'}.csv"
-        target = tmp_path / name
+        target: Path = base_dir / name
         with target.open("w", encoding="utf-8") as handle:
             handle.write(",".join(headers) + "\n")
             for row in rows:
-                handle.write(",".join(row) + "\n")
+                handle.write(",".join(str(value) for value in row) + "\n")
         return target
 
     monkeypatch.setattr(
@@ -252,7 +260,9 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
         "headers": ["foo"],
         "rows": [["bar"]],
     }
-    kubernetes_monitoring._handle_snapshot_command(success_live, mock_tracker, ":save")
+    kubernetes_monitoring._handle_snapshot_command(
+        cast(Live, success_live), mock_tracker, ":save"
+    )
     text_output = success_console.export_text()
     assert "입력 ':save' 처리 성공" in text_output
     assert "스냅샷 저장 완료" in text_output
@@ -260,7 +270,7 @@ def test_handle_snapshot_command_messages(monkeypatch, tmp_path):
     assert captured_timestamps["markdown"] == captured_timestamps["csv"]
 
 
-def test_live_frame_tracker_updates_sections():
+def test_live_frame_tracker_updates_sections() -> None:
     """LiveFrameTracker가 섹션별 프레임 키를 독립적으로 추적한다."""
     kubernetes_monitoring._clear_input_display()
     console = Console(record=True)
@@ -271,7 +281,7 @@ def test_live_frame_tracker_updates_sections():
         tracker.update(frame_key, renderable, snapshot_markdown=None, input_state="")
         assert tracker.section_frames["input"] == ("input", ("hidden", ""))
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] == ("footer", ("cmd-1",))
+        assert tracker.section_frames["footer"] is None
 
         renderable_updated = kubernetes_monitoring._compose_group(
             "cmd-2", Text("body-1")
@@ -280,4 +290,4 @@ def test_live_frame_tracker_updates_sections():
             frame_key, renderable_updated, snapshot_markdown=None, input_state=""
         )
         assert tracker.section_frames["body"] == frame_key
-        assert tracker.section_frames["footer"] == ("footer", ("cmd-2",))
+        assert tracker.section_frames["footer"] is None
