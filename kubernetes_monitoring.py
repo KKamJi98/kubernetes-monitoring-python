@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import os
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -62,6 +63,13 @@ console = Console()
 
 # 컨텍스트 변경 감지를 위한 전역 플래그
 CONTEXT_CONFIG_NEEDS_RELOAD = False
+TERMINAL_RESIZED = False
+
+
+def handle_winch(signum: int, frame: Any) -> None:
+    """Signal handler for SIGWINCH to flag terminal resize."""
+    global TERMINAL_RESIZED
+    TERMINAL_RESIZED = True
 
 
 # Kubeconfig 변경을 감지하는 핸들러
@@ -585,8 +593,13 @@ class LiveFrameTracker:
             self.latest_snapshot = snapshot_markdown
 
     def tick(self, interval: float = LIVE_REFRESH_INTERVAL) -> None:
+        global TERMINAL_RESIZED
         deadline = time.monotonic() + interval
         while True:
+            if TERMINAL_RESIZED:
+                TERMINAL_RESIZED = False
+                self.live.refresh()
+
             _tick_iteration(self.live, self.latest_snapshot)
             if self._sync_input_panel(CURRENT_INPUT_DISPLAY):
                 self.live.refresh()
@@ -2963,6 +2976,9 @@ def main() -> None:
     """
     메인 함수 실행
     """
+    if hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, handle_winch)
+
     start_kube_config_watcher()
     reload_kube_config_if_changed(force=True)  # 초기 강제 로드
     try:
