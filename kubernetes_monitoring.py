@@ -208,8 +208,17 @@ def _node_roles(node: Any) -> str:
 
 def _node_zone(node: Any) -> str:
     """노드에 설정된 가용 영역 라벨을 반환."""
-    labels = getattr(getattr(node, "metadata", None), "labels", None) or {}
-    return labels.get("topology.ebs.csi.aws.com/zone", "-")
+    labels_raw = getattr(getattr(node, "metadata", None), "labels", None)
+    if not isinstance(labels_raw, dict):
+        return "-"
+
+    zone_value = labels_raw.get("topology.kubernetes.io/zone")
+    if zone_value is None:
+        zone_value = labels_raw.get("failure-domain.beta.kubernetes.io/zone")
+
+    if zone_value is None:
+        return "-"
+    return str(zone_value)
 
 
 def _log_k8s_error(
