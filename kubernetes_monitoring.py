@@ -835,7 +835,7 @@ class _CommandInputPanel:
 
 
 class _FrameRenderable:
-    """입력 패널, 메인 콘텐츠, 명령 패널을 하나의 렌더러로 묶는다."""
+    """입력 패널과 메인 콘텐츠를 하나의 렌더러로 묶는다."""
 
     def __init__(self, command: str, *renderables: RenderableType) -> None:
         self.command = command
