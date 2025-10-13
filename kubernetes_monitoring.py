@@ -47,11 +47,57 @@ from rich.table import Table
 from rich.text import Text
 
 try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:
+    Observer = None  # type: ignore
+    FileSystemEventHandler = None  # type: ignore
+
+try:
     from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ReadTimeoutError
 except ImportError:
     ConnectTimeoutError = MaxRetryError = ReadTimeoutError = Exception  # type: ignore
 
 console = Console()
+
+# 컨텍스트 변경 감지를 위한 전역 플래그
+CONTEXT_CONFIG_NEEDS_RELOAD = False
+
+
+# Kubeconfig 변경을 감지하는 핸들러
+if FileSystemEventHandler:
+
+    class KubeConfigChangeHandler(FileSystemEventHandler):
+        """Kubeconfig 파일 변경을 감지하여 플래그를 설정."""
+
+        def __init__(self, file_path: Path):
+            self.file_path = file_path
+
+        def on_modified(self, event: Any) -> None:
+            if not event.is_directory and Path(event.src_path) == self.file_path:
+                global CONTEXT_CONFIG_NEEDS_RELOAD
+                CONTEXT_CONFIG_NEEDS_RELOAD = True
+                console.print(
+                    "\n[bold yellow]Kubeconfig 변경 감지. 다음 갱신 시 컨텍스트를 다시 로드합니다.[/bold yellow]"
+                )
+
+
+def start_kube_config_watcher() -> None:
+    """Kubeconfig 파일 감시자를 백그라운드 스레드에서 시작."""
+    if not Observer:
+        return
+
+    kube_config_path = Path(os.path.expanduser("~/.kube/config"))
+    if not kube_config_path.is_file():
+        return
+
+    event_handler = KubeConfigChangeHandler(kube_config_path)
+    observer = Observer()
+    observer.schedule(event_handler, str(kube_config_path.parent), recursive=False)
+    observer.daemon = True
+    observer.start()
+
+
 
 # 노드그룹 라벨을 변수로 분리 (기본값: node.kubernetes.io/app)
 NODE_GROUP_LABEL = "node.kubernetes.io/app"
@@ -867,13 +913,21 @@ def setup_asyncio_graceful_shutdown() -> None:
     globals()["_async_graceful_shutdown"] = _graceful_shutdown  # for advanced usage
 
 
-def load_kube_config() -> None:
-    """kube config 로드 (예외처리 포함)"""
+def reload_kube_config_if_changed(force: bool = False) -> bool:
+    """kube config 변경이 감지되었거나 강제 실행 시 리로드 후 True 반환."""
+    global CONTEXT_CONFIG_NEEDS_RELOAD
+    if not force and not CONTEXT_CONFIG_NEEDS_RELOAD:
+        return False
+
     try:
+        config.kube_config.KubeConfigLoader.cleanup_and_reset()
         config.load_kube_config()
+        CONTEXT_CONFIG_NEEDS_RELOAD = False
+        console.print("\n[bold green]Kubeconfig를 다시 로드했습니다.[/bold green]")
+        return True
     except Exception as e:
-        print(f"Error loading kube config: {e}")
-        sys.exit(1)
+        console.print(f"\n[bold red]Kubeconfig 리로드 실패: {e}[/bold red]")
+        return False
 
 
 def choose_namespace() -> Optional[str]:
@@ -881,7 +935,6 @@ def choose_namespace() -> Optional[str]:
     클러스터의 모든 namespace 목록을 표시하고, 사용자가 index로 선택
     아무 입력도 없으면 전체(namespace 전체) 조회
     """
-    load_kube_config()
     v1 = client.CoreV1Api()
     try:
         ns_list: V1NamespaceList = v1.list_namespace(
@@ -947,7 +1000,6 @@ def choose_node_group() -> Optional[str]:
     클러스터의 모든 노드 그룹 목록(NODE_GROUP_LABEL로부터) 표시 후, 사용자가 index로 선택
     아무 입력도 없으면 필터링하지 않음
     """
-    load_kube_config()
     v1 = client.CoreV1Api()
     try:
         nodes = v1.list_node().items
@@ -1059,7 +1111,6 @@ def watch_event_monitoring() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     field_selector = "type!=Normal" if event_choice == "2" else None
     if ns:
@@ -1075,6 +1126,9 @@ def watch_event_monitoring() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
+
                     try:
                         if ns:
                             response = v1.list_namespaced_event(
@@ -1296,7 +1350,7 @@ def view_restarted_container_logs() -> None:
        최근 재시작된 컨테이너 목록에서 선택하여 이전 컨테이너의 로그 확인
     """
     console.print("\n[2] 재시작된 컨테이너 확인 및 로그 조회", style="bold blue")
-    load_kube_config()
+    reload_kube_config_if_changed()
     v1 = client.CoreV1Api()
     ns = choose_namespace()
     pods = get_pods(v1, ns)
@@ -1379,7 +1433,6 @@ def watch_pod_monitoring_by_creation() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     if ns:
         command_descriptor = (
@@ -1397,6 +1450,8 @@ def watch_pod_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
                     try:
                         if ns:
                             response = v1.list_namespaced_pod(
@@ -1665,7 +1720,6 @@ def watch_non_running_pod() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     if ns:
         command_descriptor = (
@@ -1682,6 +1736,8 @@ def watch_non_running_pod() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
                     try:
                         if ns:
                             response = v1.list_namespaced_pod(
@@ -1936,13 +1992,14 @@ def watch_pod_counts() -> None:
     )
     ns = choose_namespace()
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
-    load_kube_config()
     v1 = client.CoreV1Api()
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
                     pods = get_pods(v1, ns)
                     total = len(pods)
                     normal = sum(
@@ -2018,7 +2075,6 @@ def watch_node_monitoring_by_creation() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     command_descriptor = (
         "Python client: CoreV1Api.list_node (sorted by creationTimestamp)"
@@ -2034,6 +2090,8 @@ def watch_node_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
                     try:
                         response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
                         nodes = list(getattr(response, "items", []) or [])
@@ -2260,7 +2318,6 @@ def watch_unhealthy_nodes() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     command_descriptor = "Python client: CoreV1Api.list_node (exclude Ready)"
     if filter_nodegroup:
@@ -2274,6 +2331,8 @@ def watch_unhealthy_nodes() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
                     try:
                         response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
                         nodes = list(getattr(response, "items", []) or [])
@@ -2651,7 +2710,6 @@ def watch_pod_resources() -> None:
     if filter_choice.startswith("y"):
         filter_nodegroup = choose_node_group() or ""
 
-    load_kube_config()
     v1 = client.CoreV1Api()
     node_filter: Optional[Set[str]] = None
     if filter_nodegroup:
@@ -2669,6 +2727,16 @@ def watch_pod_resources() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
+                    if reload_kube_config_if_changed():
+                        v1 = client.CoreV1Api()
+                        if filter_nodegroup:
+                            node_filter = _collect_nodes_for_group(v1, filter_nodegroup)
+                            if not node_filter:
+                                console.print(
+                                    "[bold red]NodeGroup 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
+                                )
+                                filter_nodegroup = "" # Reset filter
+
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
                     if error:
                         frame_key = _make_frame_key("error", error)
@@ -2896,6 +2964,8 @@ def main() -> None:
     """
     메인 함수 실행
     """
+    start_kube_config_watcher()
+    reload_kube_config_if_changed(force=True)  # 초기 강제 로드
     try:
         while True:
             choice = main_menu()
