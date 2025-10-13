@@ -65,7 +65,7 @@ CONTEXT_CONFIG_NEEDS_RELOAD = False
 
 
 # Kubeconfig 변경을 감지하는 핸들러
-if FileSystemEventHandler:
+if Observer is not None and FileSystemEventHandler is not None:
 
     class KubeConfigChangeHandler(FileSystemEventHandler):
         """Kubeconfig 파일 변경을 감지하여 플래그를 설정."""
@@ -96,7 +96,6 @@ def start_kube_config_watcher() -> None:
     observer.schedule(event_handler, str(kube_config_path.parent), recursive=False)
     observer.daemon = True
     observer.start()
-
 
 
 # 노드그룹 라벨을 변수로 분리 (기본값: node.kubernetes.io/app)
@@ -2735,7 +2734,7 @@ def watch_pod_resources() -> None:
                                 console.print(
                                     "[bold red]NodeGroup 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
                                 )
-                                filter_nodegroup = "" # Reset filter
+                                filter_nodegroup = ""  # Reset filter
 
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
                     if error:

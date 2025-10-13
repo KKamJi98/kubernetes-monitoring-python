@@ -86,29 +86,28 @@ def test_get_kubectl_top_pod_failure(mock_run):
 
 
 @patch("kubernetes_monitoring.config")
-def test_load_kube_config_success(mock_config):
-    """Test successful kube config loading"""
+def test_reload_kube_config_success(mock_config):
+    """Test successful kube config reloading"""
     mock_config.load_kube_config.return_value = None
 
-    # Should not raise an exception
-    kubernetes_monitoring.load_kube_config()
+    # Should return True on success
+    result = kubernetes_monitoring.reload_kube_config_if_changed(force=True)
+    assert result is True
     mock_config.load_kube_config.assert_called_once()
 
 
 @patch("kubernetes_monitoring.config")
-@patch("sys.exit")
-def test_load_kube_config_failure(mock_exit, mock_config):
-    """Test kube config loading failure"""
+def test_reload_kube_config_failure(mock_config):
+    """Test kube config reloading failure"""
     mock_config.load_kube_config.side_effect = Exception("Config error")
 
-    kubernetes_monitoring.load_kube_config()
-    mock_exit.assert_called_once_with(1)
+    result = kubernetes_monitoring.reload_kube_config_if_changed(force=True)
+    assert result is False
 
 
 @patch("kubernetes_monitoring.Prompt.ask")
 @patch("kubernetes_monitoring.client")
-@patch("kubernetes_monitoring.load_kube_config")
-def test_choose_namespace_success(mock_load_config, mock_client, mock_prompt):
+def test_choose_namespace_success(mock_client, mock_prompt):
     """Test successful namespace selection"""
     # Mock the namespace list
     mock_ns = MagicMock()
@@ -126,19 +125,16 @@ def test_choose_namespace_success(mock_load_config, mock_client, mock_prompt):
 
     # This should not raise an exception
     kubernetes_monitoring.choose_namespace()
-    mock_load_config.assert_called_once()
 
 
 @patch("kubernetes_monitoring.client")
-@patch("kubernetes_monitoring.load_kube_config")
-def test_choose_namespace_failure(mock_load_config, mock_client):
+def test_choose_namespace_failure(mock_client):
     """Test namespace selection failure"""
     mock_v1 = MagicMock()
     mock_v1.list_namespace.side_effect = Exception("API error")
     mock_client.CoreV1Api.return_value = mock_v1
 
     kubernetes_monitoring.choose_namespace()
-    assert mock_load_config.called
 
 
 def test_save_markdown_snapshot_success(tmp_path, monkeypatch):
