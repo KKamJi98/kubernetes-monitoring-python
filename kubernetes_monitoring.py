@@ -919,7 +919,7 @@ def reload_kube_config_if_changed(force: bool = False) -> bool:
         return False
 
     try:
-        config.kube_config.KubeConfigLoader.cleanup_and_reset()
+        # 파일에서 설정 다시 로드
         config.load_kube_config()
         CONTEXT_CONFIG_NEEDS_RELOAD = False
         console.print("\n[bold green]Kubeconfig를 다시 로드했습니다.[/bold green]")
