@@ -47,6 +47,13 @@ def test_format_ready_ratio():
     assert kubernetes_monitoring._format_ready_ratio(3, 2) == "[2/2]"
 
 
+def test_attrdict_missing_key_returns_none():
+    """AttrDict는 존재하지 않는 키 조회 시 None을 반환한다."""
+    wrapped = kubernetes_monitoring.AttrDict({"CamelCase": "value"})
+    assert wrapped["unknown"] is None
+    assert wrapped[0] is None
+
+
 def test_attrdict_snake_case_resolution():
     """kubectl JSON camelCase 키를 snake_case로 접근할 수 있다."""
     pod_payload = {

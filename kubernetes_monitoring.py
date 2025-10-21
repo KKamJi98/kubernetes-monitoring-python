@@ -106,10 +106,13 @@ class AttrDict:
             self._data[actual_key] = wrapped
         return wrapped
 
-    def __getitem__(self, key: str) -> Any:
-        actual_key = self._key_map.get(_normalize_attr_key(key))
-        if actual_key is None or actual_key not in self._data:
-            raise KeyError(key)
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            actual_key: Any = self._key_map.get(_normalize_attr_key(key), key)
+        else:
+            actual_key = key
+        if actual_key not in self._data:
+            return None
         value = self._data[actual_key]
         wrapped = _wrap_kubectl_value(value)
         if wrapped is not value:
@@ -117,8 +120,8 @@ class AttrDict:
         return wrapped
 
     def get(self, key: str, default: Any = None) -> Any:
-        actual_key = self._key_map.get(_normalize_attr_key(key))
-        if actual_key is None or actual_key not in self._data:
+        actual_key = self._key_map.get(_normalize_attr_key(key), key)
+        if actual_key not in self._data:
             return default
         value = self._data[actual_key]
         wrapped = _wrap_kubectl_value(value)
