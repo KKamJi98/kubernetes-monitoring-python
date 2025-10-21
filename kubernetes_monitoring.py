@@ -452,11 +452,16 @@ def _node_roles(node: Any) -> str:
     labels = _normalize_labels_mapping(
         getattr(getattr(node, "metadata", None), "labels", None)
     )
-    roles = [
-        label.split("/")[-1] or "-"
-        for label in labels
-        if isinstance(label, str) and label.startswith("node-role.kubernetes.io/")
-    ]
+    roles: List[str] = []
+    for raw_key in labels.keys():
+        if not isinstance(raw_key, str):
+            continue
+        if not raw_key.startswith("node-role.kubernetes.io/"):
+            continue
+        suffix = raw_key[len("node-role.kubernetes.io/") :].strip()
+        if not suffix:
+            suffix = "-"
+        roles.append(suffix.rstrip("/"))
     if not roles:
         return "<none>"
     return ",".join(sorted(roles))

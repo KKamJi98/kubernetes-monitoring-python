@@ -216,13 +216,14 @@ def test_node_roles_handles_non_string_label_keys():
         "metadata": {
             "labels": {
                 "node-role.kubernetes.io/control-plane": "",
+                "node-role.kubernetes.io/": "",
                 None: "ignored",
                 10: "other",
             }
         }
     }
     node = kubernetes_monitoring._wrap_kubectl_value(node_payload)
-    assert kubernetes_monitoring._node_roles(node) == "control-plane"
+    assert kubernetes_monitoring._node_roles(node) == "-,control-plane"
 
 
 @patch("kubernetes_monitoring._run_kubectl_json")
