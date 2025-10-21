@@ -340,11 +340,12 @@ def _collect_node_label_key_infos(nodes: Sequence[AttrDict]) -> List[NodeLabelKe
         normalized = _normalize_labels_mapping(labels)
         if not normalized:
             continue
-        for key, value in normalized.items():
+        for raw_key, value in normalized.items():
             if value in (None, ""):
                 continue
-            counts_by_key[key] = counts_by_key.get(key, 0) + 1
-            bucket = values_by_key.setdefault(key, set())
+            key_str = raw_key if isinstance(raw_key, str) else str(raw_key)
+            counts_by_key[key_str] = counts_by_key.get(key_str, 0) + 1
+            bucket = values_by_key.setdefault(key_str, set())
             bucket.add(str(value))
     infos = [
         NodeLabelKeyInfo(
@@ -448,11 +449,13 @@ def _node_ready_condition(node: Any) -> str:
 
 def _node_roles(node: Any) -> str:
     """노드 라벨에서 역할(role) 정보를 추출."""
-    labels = getattr(getattr(node, "metadata", None), "labels", None) or {}
+    labels = _normalize_labels_mapping(
+        getattr(getattr(node, "metadata", None), "labels", None)
+    )
     roles = [
-        label.split("/")[-1]
+        label.split("/")[-1] or "-"
         for label in labels
-        if label.startswith("node-role.kubernetes.io/")
+        if isinstance(label, str) and label.startswith("node-role.kubernetes.io/")
     ]
     if not roles:
         return "<none>"

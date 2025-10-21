@@ -192,6 +192,37 @@ def test_collect_node_label_key_infos():
     )
     assert nodegroup_info.node_count == 2
     assert "group-1" in nodegroup_info.sample_values
+    # 비문자열 키도 문자열로 변환해 수집한다.
+    additional = kubernetes_monitoring.AttrDict(
+        {
+            "metadata": {
+                "name": "node-c",
+                "labels": {
+                    123: "literal",
+                    kubernetes_monitoring.NODE_GROUP_LABEL: None,
+                },
+            }
+        }
+    )
+    infos_extended = kubernetes_monitoring._collect_node_label_key_infos(
+        [kubernetes_monitoring._wrap_kubectl_value(nodes_payload[0]), additional]
+    )
+    assert "123" in {info.key for info in infos_extended}
+
+
+def test_node_roles_handles_non_string_label_keys():
+    """node-role 라벨이 아닌 값이나 비문자열 키가 있어도 안전하게 처리한다."""
+    node_payload = {
+        "metadata": {
+            "labels": {
+                "node-role.kubernetes.io/control-plane": "",
+                None: "ignored",
+                10: "other",
+            }
+        }
+    }
+    node = kubernetes_monitoring._wrap_kubectl_value(node_payload)
+    assert kubernetes_monitoring._node_roles(node) == "control-plane"
 
 
 @patch("kubernetes_monitoring._run_kubectl_json")
