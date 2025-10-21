@@ -2270,7 +2270,7 @@ def watch_node_monitoring_by_creation() -> None:
                             "Name",
                             "Status",
                             "Roles",
-                            "NodeGroup",
+                            label_column_title,
                             "Zone",
                             "Version",
                             "CreatedAt",
@@ -2433,7 +2433,7 @@ def watch_unhealthy_nodes() -> None:
                             "Name",
                             "Status",
                             "Reason",
-                            "NodeGroup",
+                            label_column_title,
                             "Zone",
                             "Version",
                             "CreatedAt",
@@ -2859,16 +2859,19 @@ def main_menu() -> str:
         ("5", "Pod Monitoring (전체/정상/비정상 Pod 개수 출력)"),
         (
             "6",
-            "Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]",
+            "Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]",
         ),
-        ("7", "Node Monitoring (생성된 순서) [AZ, NodeGroup 표시 및 필터링 가능]"),
+        (
+            "7",
+            "Node Monitoring (생성된 순서) [AZ, 선택 라벨 표시 및 필터링 가능]",
+        ),
         (
             "8",
-            "Node Monitoring (Unhealthy Node 확인) [AZ, NodeGroup 표시 및 필터링 가능]",
+            "Node Monitoring (Unhealthy Node 확인) [AZ, 선택 라벨 표시 및 필터링 가능]",
         ),
         (
             "9",
-            "Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]",
+            "Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]",
         ),
         ("Q", "Quit"),
     ]
