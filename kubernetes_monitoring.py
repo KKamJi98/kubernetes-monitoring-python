@@ -2277,7 +2277,6 @@ def watch_node_monitoring_by_creation() -> None:
                     )
                     table.add_column("Name", style="bold green", overflow="fold")
                     table.add_column("Status")
-                    table.add_column("Roles")
                     table.add_column(label_column_title, overflow="fold")
                     table.add_column("Zone")
                     table.add_column("Version")
@@ -2292,7 +2291,6 @@ def watch_node_monitoring_by_creation() -> None:
 
                         name = getattr(metadata, "name", "-") or "-"
                         ready_state = _node_ready_condition(node)
-                        roles = _node_roles(node)
                         node_group = _node_label_value(node, label_column_key) or "-"
                         zone = _node_zone(node)
                         version = getattr(node_info, "kubelet_version", "") or "-"
@@ -2303,7 +2301,6 @@ def watch_node_monitoring_by_creation() -> None:
                         row = [
                             name,
                             ready_state,
-                            roles,
                             node_group,
                             zone,
                             version,
@@ -2318,7 +2315,6 @@ def watch_node_monitoring_by_creation() -> None:
                         [
                             "Name",
                             "Status",
-                            "Roles",
                             label_column_title,
                             "Zone",
                             "Version",
