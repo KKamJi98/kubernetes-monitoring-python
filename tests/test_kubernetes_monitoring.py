@@ -176,8 +176,8 @@ def test_summarize_pod_containers_last_restart_time():
     assert summary.last_restart_at == expected
 
 
-def test_prioritize_pods_for_creation_monitor_prefers_restarts():
-    """재시작된 Pod가 최신 생성 Pod보다 우선 정렬된다."""
+def test_prioritize_pods_for_creation_monitor_orders_by_activity():
+    """재시작 시각이 최신인 Pod가 먼저 노출된다."""
     restarted_pod = kubernetes_monitoring._wrap_kubectl_value(
         {
             "metadata": {
@@ -194,7 +194,7 @@ def test_prioritize_pods_for_creation_monitor_prefers_restarts():
                         "ready": True,
                         "restartCount": 3,
                         "lastState": {
-                            "terminated": {"finishedAt": "2024-05-01T03:00:00Z"}
+                            "terminated": {"finishedAt": "2024-06-05T03:00:00Z"}
                         },
                     }
                 ],
@@ -223,9 +223,59 @@ def test_prioritize_pods_for_creation_monitor_prefers_restarts():
         [fresh_pod, restarted_pod]
     )
     assert [entry.pod_name for entry in prioritized] == ["restarted", "fresh"]
-    expected_activity = kubernetes_monitoring._ensure_datetime("2024-05-01T03:00:00Z")
+    expected_activity = kubernetes_monitoring._ensure_datetime("2024-06-05T03:00:00Z")
     assert prioritized[0].activity_timestamp == expected_activity
     assert prioritized[0].summary.restarts == 3
+
+
+def test_prioritize_pods_for_creation_monitor_respects_creation_order():
+    """재시작이 오래된 Pod보다 새로 생성된 Pod가 우선한다."""
+    restarted_pod = kubernetes_monitoring._wrap_kubectl_value(
+        {
+            "metadata": {
+                "name": "old-restarted",
+                "namespace": "default",
+                "creationTimestamp": "2024-01-01T00:00:00Z",
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.1",
+                "containerStatuses": [
+                    {
+                        "name": "app",
+                        "ready": True,
+                        "restartCount": 3,
+                        "lastState": {
+                            "terminated": {"finishedAt": "2024-02-01T00:00:00Z"}
+                        },
+                    }
+                ],
+            },
+            "spec": {"containers": [{"name": "app"}], "nodeName": "node-a"},
+        }
+    )
+    fresh_pod = kubernetes_monitoring._wrap_kubectl_value(
+        {
+            "metadata": {
+                "name": "fresh",
+                "namespace": "default",
+                "creationTimestamp": "2024-06-01T00:00:00Z",
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.2",
+                "containerStatuses": [
+                    {"name": "app", "ready": True, "restartCount": 0}
+                ],
+            },
+            "spec": {"containers": [{"name": "app"}], "nodeName": "node-b"},
+        }
+    )
+    prioritized = kubernetes_monitoring._prioritize_pods_for_creation_monitor(
+        [restarted_pod, fresh_pod]
+    )
+    assert [entry.pod_name for entry in prioritized] == ["fresh", "old-restarted"]
+    assert prioritized[0].summary.restarts == 0
 
 
 def test_extract_node_label_infos():

@@ -388,9 +388,9 @@ def _prioritize_pods_for_creation_monitor(
         )
     priorities.sort(
         key=lambda entry: (
-            entry.restart_flag,
             entry.activity_timestamp,
             entry.summary.restarts,
+            entry.created_at or UTC_MIN,
             entry.namespace,
             entry.pod_name,
         ),
