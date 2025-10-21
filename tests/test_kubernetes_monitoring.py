@@ -47,6 +47,110 @@ def test_format_ready_ratio():
     assert kubernetes_monitoring._format_ready_ratio(3, 2) == "[2/2]"
 
 
+def test_attrdict_snake_case_resolution():
+    """kubectl JSON camelCase 키를 snake_case로 접근할 수 있다."""
+    pod_payload = {
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restartCount": 2,
+                    "lastState": {
+                        "terminated": {
+                            "finishedAt": "2024-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            ],
+            "phase": "Running",
+            "podIP": "10.0.0.10",
+        },
+        "spec": {
+            "containers": [{"name": "app"}],
+            "nodeName": "node-a",
+        },
+    }
+    pod = kubernetes_monitoring._wrap_kubectl_value(pod_payload)
+    status = pod.status
+    assert status is not None
+    containers = status.container_statuses
+    assert containers and containers[0].ready is True
+    assert containers[0].restart_count == 2
+    assert containers[0].last_state.terminated.finished_at == "2024-01-01T00:00:00Z"
+    assert status.pod_ip == "10.0.0.10"
+    assert pod.spec.node_name == "node-a"
+
+
+def test_ready_ratio_computation_with_kubectl_payload():
+    """컨테이너 Ready/Total 계산이 kubectl JSON 구조에서 정상 동작한다."""
+    pod_payload = {
+        "status": {
+            "containerStatuses": [
+                {"name": "app", "ready": True, "restartCount": 1},
+                {"name": "sidecar", "ready": False, "restartCount": 0},
+            ]
+        },
+        "spec": {
+            "containers": [
+                {"name": "app"},
+                {"name": "sidecar"},
+            ]
+        },
+    }
+    pod = kubernetes_monitoring._wrap_kubectl_value(pod_payload)
+    status = pod.status
+    spec = pod.spec
+    container_statuses = list(getattr(status, "container_statuses", None) or [])
+    ready_count = sum(1 for item in container_statuses if getattr(item, "ready", False))
+    total_containers = (
+        len(container_statuses)
+        if container_statuses
+        else len(getattr(spec, "containers", []) or [])
+    )
+    ready_display = kubernetes_monitoring._format_ready_ratio(
+        ready_count, total_containers
+    )
+    assert ready_display == "[1/2]"
+
+
+def test_extract_node_group_infos():
+    """NodeGroup 라벨 목록이 정렬 및 카운트된 정보를 반환한다."""
+    nodes_payload = [
+        {
+            "metadata": {
+                "name": "node-a",
+                "labels": {kubernetes_monitoring.NODE_GROUP_LABEL: "group-1"},
+            }
+        },
+        {
+            "metadata": {
+                "name": "node-b",
+                "labels": {kubernetes_monitoring.NODE_GROUP_LABEL: "group-2"},
+            }
+        },
+        {
+            "metadata": {
+                "name": "node-c",
+                "labels": {kubernetes_monitoring.NODE_GROUP_LABEL: "group-1"},
+            }
+        },
+        {
+            "metadata": {
+                "name": "node-d",
+                "labels": {"unrelated": "value"},
+            }
+        },
+    ]
+    nodes = [kubernetes_monitoring._wrap_kubectl_value(item) for item in nodes_payload]
+    infos = kubernetes_monitoring._extract_node_group_infos(nodes)
+    assert [info.value for info in infos] == ["group-1", "group-2"]
+    group1 = infos[0]
+    assert group1.node_count == 2
+    assert group1.nodes == ("node-a", "node-c")
+    assert group1.label == f"{kubernetes_monitoring.NODE_GROUP_LABEL}=group-1"
+
+
 @patch("kubernetes_monitoring.subprocess.run")
 def test_get_kubectl_top_pod_all_namespaces_success(mock_run):
     """kubectl top pod 전체 namespace 파싱 검증"""

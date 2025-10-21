@@ -74,33 +74,56 @@ if TYPE_CHECKING:
         def getwch(self) -> str: ...
 
 
+def _normalize_attr_key(key: Any) -> str:
+    """Attribute-style 접근을 위한 키 정규화."""
+    if isinstance(key, str):
+        text = key
+    else:
+        text = str(key)
+    return "".join(ch for ch in text if ch.isalnum()).lower()
+
+
 class AttrDict:
     """dict를 속성 접근 방식으로 다룰 수 있게 감싸는 래퍼."""
 
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "_key_map")
 
     def __init__(self, data: Dict[str, Any]) -> None:
         self._data = data
+        key_map: Dict[str, str] = {}
+        for original_key in data:
+            normalized = _normalize_attr_key(original_key)
+            key_map.setdefault(normalized, original_key)
+        self._key_map = key_map
 
     def __getattr__(self, item: str) -> Any:
-        if item not in self._data:
+        actual_key = self._key_map.get(_normalize_attr_key(item))
+        if actual_key is None or actual_key not in self._data:
             return None
-        value = self._data[item]
+        value = self._data[actual_key]
         wrapped = _wrap_kubectl_value(value)
         if wrapped is not value:
-            self._data[item] = wrapped
+            self._data[actual_key] = wrapped
         return wrapped
 
     def __getitem__(self, key: str) -> Any:
-        return self.__getattr__(key)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self._data:
-            return default
-        value = self._data[key]
+        actual_key = self._key_map.get(_normalize_attr_key(key))
+        if actual_key is None or actual_key not in self._data:
+            raise KeyError(key)
+        value = self._data[actual_key]
         wrapped = _wrap_kubectl_value(value)
         if wrapped is not value:
-            self._data[key] = wrapped
+            self._data[actual_key] = wrapped
+        return wrapped
+
+    def get(self, key: str, default: Any = None) -> Any:
+        actual_key = self._key_map.get(_normalize_attr_key(key))
+        if actual_key is None or actual_key not in self._data:
+            return default
+        value = self._data[actual_key]
+        wrapped = _wrap_kubectl_value(value)
+        if wrapped is not value:
+            self._data[actual_key] = wrapped
         return wrapped
 
     def to_dict(self) -> Dict[str, Any]:
@@ -187,6 +210,69 @@ class SnapshotPayload:
     status: str
     body: str
     command: Optional[str]
+
+
+@dataclass(frozen=True)
+class PodContainerSummary:
+    """Pod 컨테이너 Ready/Restart 지표 요약."""
+
+    ready: int
+    total: int
+    restarts: int
+
+
+@dataclass(frozen=True)
+class NodeGroupInfo:
+    """NodeGroup 라벨 값과 해당 노드 목록."""
+
+    value: str
+    nodes: Tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        return f"{NODE_GROUP_LABEL}={self.value}"
+
+    @property
+    def node_count(self) -> int:
+        return len(self.nodes)
+
+
+def _summarize_pod_containers(pod: AttrDict) -> PodContainerSummary:
+    """kubectl JSON Pod 객체에서 Ready/총 컨테이너/재시작 횟수를 계산."""
+    status = getattr(pod, "status", None)
+    spec = getattr(pod, "spec", None)
+    container_statuses = list(getattr(status, "container_statuses", None) or [])
+    ready = sum(1 for item in container_statuses if getattr(item, "ready", False))
+    total = (
+        len(container_statuses)
+        if container_statuses
+        else len(getattr(spec, "containers", []) or [])
+    )
+    restarts = sum(
+        int(getattr(item, "restart_count", 0)) for item in container_statuses
+    )
+    return PodContainerSummary(ready=ready, total=total, restarts=restarts)
+
+
+def _extract_node_group_infos(nodes: Sequence[AttrDict]) -> List[NodeGroupInfo]:
+    """노드 목록에서 NodeGroup 라벨 정보를 정리해 반환."""
+    node_groups: Dict[str, Set[str]] = {}
+    for node in nodes:
+        metadata = getattr(node, "metadata", None)
+        labels = getattr(metadata, "labels", None) or {}
+        value = labels.get(NODE_GROUP_LABEL)
+        if not value:
+            continue
+        node_name = getattr(metadata, "name", "") or ""
+        if not node_name:
+            continue
+        group_nodes = node_groups.setdefault(str(value), set())
+        group_nodes.add(str(node_name))
+    infos = [
+        NodeGroupInfo(value=value, nodes=tuple(sorted(node_names)))
+        for value, node_names in node_groups.items()
+    ]
+    return sorted(infos, key=lambda info: info.value.lower())
 
 
 def _ensure_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
@@ -1129,23 +1215,28 @@ def choose_node_group() -> Optional[str]:
         console.print(f"명령어: {command}", style="dim")
         return None
 
-    node_groups: Set[str] = set()
-    for node in getattr(payload, "items", []) or []:
-        labels = getattr(getattr(node, "metadata", None), "labels", None)
-        if labels and NODE_GROUP_LABEL in labels:
-            value = labels[NODE_GROUP_LABEL]
-            if value:
-                node_groups.add(str(value))
-
-    sorted_groups = sorted(node_groups)
-    if not sorted_groups:
+    items = list(getattr(payload, "items", []) or [])
+    node_group_infos = _extract_node_group_infos(items)
+    if not node_group_infos:
         print("노드 그룹이 존재하지 않습니다.")
         return None
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("Index", style="bold green", width=5)
-    table.add_column("Node Group", overflow="fold")
-    for idx, ng in enumerate(sorted_groups, start=1):
-        table.add_row(str(idx), ng)
+    table.add_column("Label", overflow="fold")
+    table.add_column("Node Count", justify="right")
+    table.add_column("Sample Nodes", overflow="fold")
+    for idx, info in enumerate(node_group_infos, start=1):
+        sample_nodes = ", ".join(info.nodes[:3])
+        if len(info.nodes) > 3:
+            sample_nodes = f"{sample_nodes}, ..."
+        if not sample_nodes:
+            sample_nodes = "-"
+        table.add_row(
+            str(idx),
+            info.label,
+            str(info.node_count),
+            sample_nodes,
+        )
     console.print("\n=== Available Node Groups ===", style="bold green")
     console.print(table)
 
@@ -1158,10 +1249,15 @@ def choose_node_group() -> Optional[str]:
         print("숫자로 입력해주세요. 필터링하지 않음으로 진행합니다.")
         return None
     index = int(selection)
-    if index < 1 or index > len(sorted_groups):
+    if index < 1 or index > len(node_group_infos):
         print("유효하지 않은 번호입니다. 필터링하지 않음으로 진행합니다.")
         return None
-    chosen_ng = sorted_groups[index - 1]
+    chosen_info = node_group_infos[index - 1]
+    console.print(
+        f"선택한 NodeGroup 라벨: {chosen_info.label} (노드 {chosen_info.node_count}개)",
+        style="bold green",
+    )
+    chosen_ng = chosen_info.value
     return chosen_ng
 
 
@@ -1599,27 +1695,12 @@ def watch_pod_monitoring_by_creation() -> None:
                         creation = _format_timestamp(
                             getattr(metadata, "creation_timestamp", None)
                         )
-                        container_statuses = list(
-                            getattr(status, "container_statuses", None) or []
-                        )
-                        ready_count = sum(
-                            1
-                            for item in container_statuses
-                            if getattr(item, "ready", False)
-                        )
-                        total_containers = (
-                            len(container_statuses)
-                            if container_statuses
-                            else len(getattr(spec, "containers", []) or [])
-                        )
+                        summary = _summarize_pod_containers(pod)
                         ready_display = _format_ready_ratio(
-                            ready_count,
-                            total_containers,
+                            summary.ready,
+                            summary.total,
                         )
-                        restarts = sum(
-                            int(getattr(item, "restart_count", 0))
-                            for item in container_statuses
-                        )
+                        restarts = summary.restarts
                         phase = getattr(status, "phase", "") or "-"
                         pod_ip = getattr(status, "pod_ip", "") or "-"
                         node_name = getattr(spec, "node_name", "") or "-"
@@ -1794,27 +1875,12 @@ def watch_non_running_pod() -> None:
                         creation = _format_timestamp(
                             getattr(metadata, "creation_timestamp", None)
                         )
-                        container_statuses = list(
-                            getattr(status, "container_statuses", None) or []
-                        )
-                        ready_count = sum(
-                            1
-                            for item in container_statuses
-                            if getattr(item, "ready", False)
-                        )
-                        total_containers = (
-                            len(container_statuses)
-                            if container_statuses
-                            else len(getattr(spec, "containers", []) or [])
-                        )
+                        summary = _summarize_pod_containers(pod)
                         ready_display = _format_ready_ratio(
-                            ready_count,
-                            total_containers,
+                            summary.ready,
+                            summary.total,
                         )
-                        restarts = sum(
-                            int(getattr(item, "restart_count", 0))
-                            for item in container_statuses
-                        )
+                        restarts = summary.restarts
                         phase = getattr(status, "phase", "") or "-"
                         pod_ip = getattr(status, "pod_ip", "") or "-"
                         node_name = getattr(spec, "node_name", "") or "-"
