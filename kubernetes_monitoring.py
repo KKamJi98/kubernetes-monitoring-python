@@ -3,10 +3,10 @@
 import contextlib
 import csv
 import datetime
+import json
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -27,18 +27,6 @@ from typing import (
     cast,
 )
 
-try:
-    from kubernetes import client, config
-    from kubernetes.client import CoreV1Api, CoreV1Event, V1NamespaceList, V1Node, V1Pod
-    from kubernetes.client.exceptions import ApiException
-except ImportError:
-    client = None  # type: ignore
-    config = None  # type: ignore
-    CoreV1Api = None  # type: ignore
-    CoreV1Event = None  # type: ignore
-    V1Pod = None  # type: ignore
-    V1Node = None  # type: ignore
-    ApiException = Exception  # type: ignore[assignment]
 from rich import box
 from rich.console import Console, Group, RenderableType
 from rich.layout import Layout
@@ -48,22 +36,8 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
-try:
-    from watchdog.events import FileSystemEventHandler
-    from watchdog.observers import Observer
-except ImportError:
-    Observer = None  # type: ignore
-    FileSystemEventHandler = None  # type: ignore
-
-try:
-    from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ReadTimeoutError
-except ImportError:
-    ConnectTimeoutError = MaxRetryError = ReadTimeoutError = Exception  # type: ignore
-
 console = Console()
 
-# 컨텍스트 변경 감지를 위한 전역 플래그
-CONTEXT_CONFIG_NEEDS_RELOAD = False
 TERMINAL_RESIZED = False
 
 
@@ -71,40 +45,6 @@ def handle_winch(signum: int, frame: Any) -> None:
     """Signal handler for SIGWINCH to flag terminal resize."""
     global TERMINAL_RESIZED
     TERMINAL_RESIZED = True
-
-
-# Kubeconfig 변경을 감지하는 핸들러
-if Observer is not None and FileSystemEventHandler is not None:
-
-    class KubeConfigChangeHandler(FileSystemEventHandler):
-        """Kubeconfig 파일 변경을 감지하여 플래그를 설정."""
-
-        def __init__(self, file_path: Path):
-            self.file_path = file_path
-
-        def on_modified(self, event: Any) -> None:
-            if not event.is_directory and Path(event.src_path) == self.file_path:
-                global CONTEXT_CONFIG_NEEDS_RELOAD
-                CONTEXT_CONFIG_NEEDS_RELOAD = True
-                console.print(
-                    "\n[bold yellow]Kubeconfig 변경 감지. 다음 갱신 시 컨텍스트를 다시 로드합니다.[/bold yellow]"
-                )
-
-
-def start_kube_config_watcher() -> None:
-    """Kubeconfig 파일 감시자를 백그라운드 스레드에서 시작."""
-    if not Observer:
-        return
-
-    kube_config_path = Path(os.path.expanduser("~/.kube/config"))
-    if not kube_config_path.is_file():
-        return
-
-    event_handler = KubeConfigChangeHandler(kube_config_path)
-    observer = Observer()
-    observer.schedule(event_handler, str(kube_config_path.parent), recursive=False)
-    observer.daemon = True
-    observer.start()
 
 
 # 노드그룹 라벨을 변수로 분리 (기본값: node.kubernetes.io/app)
@@ -125,7 +65,6 @@ COMMAND_INPUT_VISIBLE = False
 FrameKey = Tuple[str, Tuple[str, ...]]
 
 API_REQUEST_TIMEOUT = 10.0
-_API_ERROR_SIGNATURES: Set[str] = set()
 
 if TYPE_CHECKING:
 
@@ -133,6 +72,78 @@ if TYPE_CHECKING:
         def kbhit(self) -> bool: ...
 
         def getwch(self) -> str: ...
+
+
+class AttrDict:
+    """dict를 속성 접근 방식으로 다룰 수 있게 감싸는 래퍼."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Dict[str, Any]) -> None:
+        self._data = data
+
+    def __getattr__(self, item: str) -> Any:
+        if item not in self._data:
+            return None
+        value = self._data[item]
+        wrapped = _wrap_kubectl_value(value)
+        if wrapped is not value:
+            self._data[item] = wrapped
+        return wrapped
+
+    def __getitem__(self, key: str) -> Any:
+        return self.__getattr__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self._data:
+            return default
+        value = self._data[key]
+        wrapped = _wrap_kubectl_value(value)
+        if wrapped is not value:
+            self._data[key] = wrapped
+        return wrapped
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self._data
+
+
+def _wrap_kubectl_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return AttrDict(value)
+    if isinstance(value, list):
+        return [_wrap_kubectl_value(item) for item in value]
+    return value
+
+
+def _run_kubectl_json(
+    args: Sequence[str], *, timeout: float = API_REQUEST_TIMEOUT
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """kubectl 명령을 JSON 출력으로 실행한 뒤 결과를 AttrDict로 감싼다."""
+    command = ["kubectl", *args, "-o", "json"]
+    command_str = shlex.join(command)
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "kubectl command timed out.", command_str
+    if completed.returncode != 0:
+        error = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or "kubectl command failed."
+        )
+        return None, error, command_str
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return None, f"kubectl JSON decode error: {exc}", command_str
+    return _wrap_kubectl_value(payload), None, command_str
 
 
 def _set_input_display(text: str) -> None:
@@ -293,20 +304,6 @@ def _node_zone(node: Any) -> str:
     if zone_value is None:
         return "-"
     return str(zone_value)
-
-
-def _log_k8s_error(
-    category: str, header: str, guidance: str, detail: Exception
-) -> None:
-    """Kubernetes API 오류 메시지를 한 번만 출력."""
-    signature = f"{category}:{type(detail).__name__}:{detail}"
-    if signature in _API_ERROR_SIGNATURES:
-        return
-    _API_ERROR_SIGNATURES.add(signature)
-    console.print(f"\n[bold red]{header}[/bold red]")
-    if guidance:
-        console.print(guidance, style="bold yellow")
-    console.print(f"(세부 정보: {detail})", style="dim")
 
 
 def _status_icon(status: str) -> Optional[str]:
@@ -972,16 +969,10 @@ def _get_kubectl_top_pod(
     return metrics, None, shlex.join(cmd)
 
 
-def _map_pod_to_node(
-    v1_api: CoreV1Api, namespace: Optional[str] = None
-) -> Dict[Tuple[str, str], str]:
+def _map_pod_to_node(namespace: Optional[str] = None) -> Dict[Tuple[str, str], str]:
     """Pod -> Node 매핑을 생성."""
-    try:
-        if namespace:
-            pods = v1_api.list_namespaced_pod(namespace=namespace).items
-        else:
-            pods = v1_api.list_pod_for_all_namespaces().items
-    except Exception:
+    pods, error, _ = get_pods(namespace)
+    if error:
         return {}
     mapping: Dict[Tuple[str, str], str] = {}
     for pod in pods:
@@ -993,17 +984,20 @@ def _map_pod_to_node(
     return mapping
 
 
-def _collect_nodes_for_group(v1_api: CoreV1Api, node_group: str) -> Set[str]:
+def _collect_nodes_for_group(node_group: str) -> Set[str]:
     """선택한 NodeGroup에 속한 노드 이름 집합을 반환."""
-    try:
-        nodes = v1_api.list_node(
-            label_selector=f"{NODE_GROUP_LABEL}={node_group}"
-        ).items
-    except Exception:
+    payload, error, _ = _run_kubectl_json(
+        ["get", "nodes", "-l", f"{NODE_GROUP_LABEL}={node_group}"]
+    )
+    if error or payload is None:
         return set()
-    return {
-        node.metadata.name for node in nodes if node.metadata and node.metadata.name
-    }
+    result: Set[str] = set()
+    for node in getattr(payload, "items", []) or []:
+        metadata = getattr(node, "metadata", None)
+        name = getattr(metadata, "name", None)
+        if name:
+            result.add(str(name))
+    return result
 
 
 def cleanup() -> None:
@@ -1074,60 +1068,23 @@ def setup_asyncio_graceful_shutdown() -> None:
     globals()["_async_graceful_shutdown"] = _graceful_shutdown  # for advanced usage
 
 
-def reload_kube_config_if_changed(force: bool = False) -> bool:
-    """kube config 변경이 감지되었거나 강제 실행 시 리로드 후 True 반환."""
-    global CONTEXT_CONFIG_NEEDS_RELOAD
-    if not force and not CONTEXT_CONFIG_NEEDS_RELOAD:
-        return False
-
-    try:
-        # 파일에서 설정 다시 로드
-        config.load_kube_config()
-        CONTEXT_CONFIG_NEEDS_RELOAD = False
-        console.print("\n[bold green]Kubeconfig를 다시 로드했습니다.[/bold green]")
-        return True
-    except Exception as e:
-        console.print(f"\n[bold red]Kubeconfig 리로드 실패: {e}[/bold red]")
-        return False
-
-
 def choose_namespace() -> Optional[str]:
     """
     클러스터의 모든 namespace 목록을 표시하고, 사용자가 index로 선택
     아무 입력도 없으면 전체(namespace 전체) 조회
     """
-    v1 = client.CoreV1Api()
-    try:
-        ns_list: V1NamespaceList = v1.list_namespace(
-            _request_timeout=API_REQUEST_TIMEOUT
+    payload, error, command = _run_kubectl_json(["get", "namespaces"])
+    if error or payload is None:
+        console.print(
+            "Namespace 정보를 가져오는 중 오류가 발생했습니다.",
+            style="bold red",
         )
-        items = ns_list.items
-    except (MaxRetryError, ConnectTimeoutError, ReadTimeoutError, socket.timeout) as e:
-        _log_k8s_error(
-            "namespace-timeout",
-            "Kubernetes API 응답이 지연되어 namespace 목록을 조회하지 못했습니다.",
-            "인증/네트워크 상태를 확인한 뒤 `kubectl get ns`로 액세스를 먼저 검증해주세요.",
-            e,
-        )
-        return None
-    except ApiException as e:
-        status = getattr(e, "status", "unknown")
-        reason = getattr(e, "reason", "unknown")
-        guidance = (
-            f"status={status} reason={reason}. "
-            "`kubectl config view`로 context를 확인하고 자격 증명을 갱신해주세요."
-        )
-        _log_k8s_error(
-            "namespace-api",
-            "Namespace 조회 중 API 오류가 발생했습니다.",
-            guidance,
-            e,
-        )
-        return None
-    except Exception as e:
-        print(f"Error fetching namespaces: {e}")
+        detail = error or "kubectl이 빈 응답을 반환했습니다."
+        console.print(detail, style="bold yellow")
+        console.print(f"명령어: {command}", style="dim")
         return None
 
+    items = getattr(payload, "items", []) or []
     if not items:
         print("Namespace가 존재하지 않습니다.")
         return None
@@ -1161,26 +1118,33 @@ def choose_node_group() -> Optional[str]:
     클러스터의 모든 노드 그룹 목록(NODE_GROUP_LABEL로부터) 표시 후, 사용자가 index로 선택
     아무 입력도 없으면 필터링하지 않음
     """
-    v1 = client.CoreV1Api()
-    try:
-        nodes = v1.list_node().items
-    except Exception as e:
-        print(f"Error fetching nodes: {e}")
+    payload, error, command = _run_kubectl_json(["get", "nodes"])
+    if error or payload is None:
+        console.print(
+            "Node 정보를 가져오는 중 오류가 발생했습니다.",
+            style="bold red",
+        )
+        detail = error or "kubectl이 빈 응답을 반환했습니다."
+        console.print(detail, style="bold yellow")
+        console.print(f"명령어: {command}", style="dim")
         return None
 
-    node_groups: List[str] = []
-    temp_node_groups = set()
-    for node in nodes:
-        if node.metadata.labels and NODE_GROUP_LABEL in node.metadata.labels:
-            temp_node_groups.add(node.metadata.labels[NODE_GROUP_LABEL])
-    node_groups = sorted(list(temp_node_groups))
-    if not node_groups:
+    node_groups: Set[str] = set()
+    for node in getattr(payload, "items", []) or []:
+        labels = getattr(getattr(node, "metadata", None), "labels", None)
+        if labels and NODE_GROUP_LABEL in labels:
+            value = labels[NODE_GROUP_LABEL]
+            if value:
+                node_groups.add(str(value))
+
+    sorted_groups = sorted(node_groups)
+    if not sorted_groups:
         print("노드 그룹이 존재하지 않습니다.")
         return None
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("Index", style="bold green", width=5)
     table.add_column("Node Group", overflow="fold")
-    for idx, ng in enumerate(node_groups, start=1):
+    for idx, ng in enumerate(sorted_groups, start=1):
         table.add_row(str(idx), ng)
     console.print("\n=== Available Node Groups ===", style="bold green")
     console.print(table)
@@ -1194,10 +1158,10 @@ def choose_node_group() -> Optional[str]:
         print("숫자로 입력해주세요. 필터링하지 않음으로 진행합니다.")
         return None
     index = int(selection)
-    if index < 1 or index > len(node_groups):
+    if index < 1 or index > len(sorted_groups):
         print("유효하지 않은 번호입니다. 필터링하지 않음으로 진행합니다.")
         return None
-    chosen_ng = node_groups[index - 1]
+    chosen_ng = sorted_groups[index - 1]
     return chosen_ng
 
 
@@ -1213,49 +1177,77 @@ def get_tail_lines(prompt="몇 줄씩 확인할까요? (숫자 입력. default: 
         return "20"
 
 
-def get_pods(v1_api: CoreV1Api, namespace: Optional[str] = None) -> List[V1Pod]:
+def get_pods(
+    namespace: Optional[str] = None,
+) -> Tuple[List[AttrDict], Optional[str], str]:
     """
     지정된 namespace 또는 전체 namespace에서 Pod 목록을 가져옵니다.
     """
-    try:
-        if namespace:
-            return list(
-                v1_api.list_namespaced_pod(
-                    namespace=namespace, _request_timeout=API_REQUEST_TIMEOUT
-                ).items
-            )
-        else:
-            return list(
-                v1_api.list_pod_for_all_namespaces(
-                    _request_timeout=API_REQUEST_TIMEOUT
-                ).items
-            )
-    except (MaxRetryError, ConnectTimeoutError, ReadTimeoutError, socket.timeout) as e:
-        _log_k8s_error(
-            "pod-timeout",
-            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다.",
-            "VPN, 사설망 연결, 인증 세션(AWS SSO / Azure / GCP 등)을 다시 확인하세요.",
-            e,
+    args: List[str] = ["get", "pods"]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("-A")
+    payload, error, command = _run_kubectl_json(args)
+    if error or payload is None:
+        return [], error or "kubectl이 빈 응답을 반환했습니다.", command
+    items = getattr(payload, "items", []) or []
+    return list(items), None, command
+
+
+def get_nodes(
+    label_selector: Optional[str] = None,
+) -> Tuple[List[AttrDict], Optional[str], str]:
+    """노드 목록을 조회한다."""
+    args: List[str] = ["get", "nodes"]
+    if label_selector:
+        args.extend(["-l", label_selector])
+    payload, error, command = _run_kubectl_json(args)
+    if error or payload is None:
+        return [], error or "kubectl이 빈 응답을 반환했습니다.", command
+    items = getattr(payload, "items", []) or []
+    return list(items), None, command
+
+
+def _handle_kubectl_fetch_error(
+    tracker: "LiveFrameTracker",
+    *,
+    command: str,
+    context: str,
+    detail: str,
+    snapshot_title: str,
+) -> None:
+    """kubectl 호출 오류를 공통 형식으로 렌더링."""
+    normalized = detail or "kubectl이 빈 응답을 반환했습니다."
+    is_timeout = "timeout" in normalized.lower()
+    status = "warning" if is_timeout else "error"
+    panel_style = "bold yellow" if is_timeout else "bold red"
+    panel_title = "경고" if is_timeout else "오류"
+    if is_timeout:
+        message = (
+            f"{context} 중 지연이 발생했습니다. 네트워크 연결과 인증 상태를 확인하세요."
         )
-        return []
-    except ApiException as e:
-        status = getattr(e, "status", "unknown")
-        reason = getattr(e, "reason", "unknown")
-        guidance = (
-            f"status={status} reason={reason}. "
-            "자격 증명을 재갱신 후 다시 실행하거나 "
-            "`kubectl get pods`로 접근 가능 여부를 확인하세요."
+    else:
+        message = f"{context} 중 오류가 발생했습니다."
+    body_text = f"{message}\n세부 정보: {normalized}"
+    frame_key = _make_frame_key("kubectl_error", context, normalized)
+    snapshot = _format_plain_snapshot(
+        SnapshotPayload(
+            title=snapshot_title,
+            status=status,
+            body=body_text,
+            command=command,
         )
-        _log_k8s_error(
-            "pod-api",
-            "Pod 조회 중 API 오류가 발생했습니다.",
-            guidance,
-            e,
-        )
-        return []
-    except Exception as e:
-        print(f"Error fetching pods: {e}")
-        return []
+    )
+    tracker.update(
+        frame_key,
+        _compose_group(
+            command,
+            Panel(body_text, title=panel_title, style=panel_style),
+        ),
+        snapshot,
+        input_state=CURRENT_INPUT_DISPLAY,
+    )
 
 
 def watch_event_monitoring() -> None:
@@ -1272,14 +1264,14 @@ def watch_event_monitoring() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    v1 = client.CoreV1Api()
     field_selector = "type!=Normal" if event_choice == "2" else None
+    kubectl_args: List[str] = ["get", "events"]
     if ns:
-        command_descriptor = "Python client: CoreV1Api.list_namespaced_event"
+        kubectl_args.extend(["-n", ns])
     else:
-        command_descriptor = "Python client: CoreV1Api.list_event_for_all_namespaces"
+        kubectl_args.append("-A")
     if field_selector:
-        command_descriptor = f"{command_descriptor} (field_selector={field_selector})"
+        kubectl_args.extend(["--field-selector", field_selector])
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1287,105 +1279,20 @@ def watch_event_monitoring() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-
-                    try:
-                        if ns:
-                            response = v1.list_namespaced_event(
-                                namespace=ns,
-                                field_selector=field_selector,
-                                _request_timeout=API_REQUEST_TIMEOUT,
-                            )
-                        else:
-                            response = v1.list_event_for_all_namespaces(
-                                field_selector=field_selector,
-                                _request_timeout=API_REQUEST_TIMEOUT,
-                            )
-                    except (
-                        MaxRetryError,
-                        ConnectTimeoutError,
-                        ReadTimeoutError,
-                        socket.timeout,
-                    ) as exc:
-                        message = (
-                            "이벤트 정보를 가져오는 중 네트워크 지연이 감지되었습니다. "
-                            "VPN 혹은 인증 세션 상태를 점검해 주세요."
-                        )
-                        frame_key = _make_frame_key("timeout", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Event Monitoring - Timeout",
-                                status="warning",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="경고", style="bold yellow"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except ApiException as exc:
-                        status = getattr(exc, "status", "unknown")
-                        reason = getattr(exc, "reason", "")
-                        detail = getattr(exc, "body", "") or str(exc)
-                        message = (
-                            f"이벤트 정보를 가져오는 중 API 오류가 발생했습니다. "
-                            f"(HTTP {status} {reason})"
-                        )
-                        frame_key = _make_frame_key(
-                            "api_error", str(status), reason, detail
-                        )
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Event Monitoring - Error",
-                                status="error",
-                                body=f"{message}\n세부 정보: {detail}",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
-                        message = f"이벤트 정보를 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
-                        frame_key = _make_frame_key("unexpected_error", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Event Monitoring - Error",
-                                status="error",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                    payload, error, command_descriptor = _run_kubectl_json(kubectl_args)
+                    if error or payload is None:
+                        detail = error or "kubectl이 빈 응답을 반환했습니다."
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="이벤트 정보를 가져오는",
+                            detail=detail,
+                            snapshot_title="Event Monitoring - Error",
                         )
                         tracker.tick()
                         continue
 
-                    items = list(getattr(response, "items", []) or [])
+                    items = list(getattr(payload, "items", []) or [])
                     if not items:
                         frame_key = _make_frame_key("empty")
                         snapshot = _format_plain_snapshot(
@@ -1516,10 +1423,16 @@ def view_restarted_container_logs() -> None:
        최근 재시작된 컨테이너 목록에서 선택하여 이전 컨테이너의 로그 확인
     """
     console.print("\n[2] 재시작된 컨테이너 확인 및 로그 조회", style="bold blue")
-    reload_kube_config_if_changed()
-    v1 = client.CoreV1Api()
     ns = choose_namespace()
-    pods = get_pods(v1, ns)
+    pods, error, command = get_pods(ns)
+    if error:
+        console.print(
+            "Pod 정보를 가져오는 중 오류가 발생했습니다.",
+            style="bold red",
+        )
+        console.print(f"{error}", style="bold yellow")
+        console.print(f"명령어: {command}", style="dim")
+        return
     if not pods:
         return
 
@@ -1599,16 +1512,6 @@ def watch_pod_monitoring_by_creation() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    v1 = client.CoreV1Api()
-    if ns:
-        command_descriptor = (
-            "Python client: CoreV1Api.list_namespaced_pod (sorted by creationTimestamp)"
-        )
-    else:
-        command_descriptor = (
-            "Python client: CoreV1Api.list_pod_for_all_namespaces "
-            "(sorted by creationTimestamp)"
-        )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1616,98 +1519,14 @@ def watch_pod_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                    try:
-                        if ns:
-                            response = v1.list_namespaced_pod(
-                                namespace=ns,
-                                _request_timeout=API_REQUEST_TIMEOUT,
-                            )
-                        else:
-                            response = v1.list_pod_for_all_namespaces(
-                                _request_timeout=API_REQUEST_TIMEOUT
-                            )
-                        pods = list(getattr(response, "items", []) or [])
-                    except (
-                        MaxRetryError,
-                        ConnectTimeoutError,
-                        ReadTimeoutError,
-                        socket.timeout,
-                    ) as exc:
-                        message = (
-                            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다. "
-                            "네트워크 연결과 인증 상태를 확인하세요."
-                        )
-                        frame_key = _make_frame_key("timeout", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Monitoring (생성 순) - Timeout",
-                                status="warning",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="경고", style="bold yellow"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except ApiException as exc:
-                        status = getattr(exc, "status", "unknown")
-                        reason = getattr(exc, "reason", "")
-                        detail = getattr(exc, "body", "") or str(exc)
-                        message = (
-                            f"Pod 목록을 조회하는 중 API 오류가 발생했습니다. "
-                            f"(HTTP {status} {reason})"
-                        )
-                        frame_key = _make_frame_key(
-                            "api_error", str(status), reason, detail
-                        )
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Monitoring (생성 순) - Error",
-                                status="error",
-                                body=f"{message}\n세부 정보: {detail}",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
-                        message = f"Pod 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
-                        frame_key = _make_frame_key("unexpected_error", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Monitoring (생성 순) - Error",
-                                status="error",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                    pods, error, command_descriptor = get_pods(ns)
+                    if error:
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="Pod 정보를 가져오는",
+                            detail=error,
+                            snapshot_title="Pod Monitoring (생성 순) - Error",
                         )
                         tracker.tick()
                         continue
@@ -1888,15 +1707,6 @@ def watch_non_running_pod() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    v1 = client.CoreV1Api()
-    if ns:
-        command_descriptor = (
-            "Python client: CoreV1Api.list_namespaced_pod (exclude Running)"
-        )
-    else:
-        command_descriptor = (
-            "Python client: CoreV1Api.list_pod_for_all_namespaces (exclude Running)"
-        )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -1904,103 +1714,19 @@ def watch_non_running_pod() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                    try:
-                        if ns:
-                            response = v1.list_namespaced_pod(
-                                namespace=ns,
-                                _request_timeout=API_REQUEST_TIMEOUT,
-                            )
-                        else:
-                            response = v1.list_pod_for_all_namespaces(
-                                _request_timeout=API_REQUEST_TIMEOUT
-                            )
-                        pods = list(getattr(response, "items", []) or [])
-                    except (
-                        MaxRetryError,
-                        ConnectTimeoutError,
-                        ReadTimeoutError,
-                        socket.timeout,
-                    ) as exc:
-                        message = (
-                            "Pod 정보를 가져오는 중 API 응답이 지연되었습니다. "
-                            "네트워크 연결과 인증 상태를 확인하세요."
-                        )
-                        frame_key = _make_frame_key("timeout", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Non-Running Pod - Timeout",
-                                status="warning",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="경고", style="bold yellow"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except ApiException as exc:
-                        status = getattr(exc, "status", "unknown")
-                        reason = getattr(exc, "reason", "")
-                        detail = getattr(exc, "body", "") or str(exc)
-                        message = (
-                            f"Pod 목록을 조회하는 중 API 오류가 발생했습니다. "
-                            f"(HTTP {status} {reason})"
-                        )
-                        frame_key = _make_frame_key(
-                            "api_error", str(status), reason, detail
-                        )
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Non-Running Pod - Error",
-                                status="error",
-                                body=f"{message}\n세부 정보: {detail}",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
-                        message = f"Pod 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
-                        frame_key = _make_frame_key("unexpected_error", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Non-Running Pod - Error",
-                                status="error",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                    pods, error, command_descriptor = get_pods(ns)
+                    if error:
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="Pod 정보를 가져오는",
+                            detail=error,
+                            snapshot_title="Non-Running Pod - Error",
                         )
                         tracker.tick()
                         continue
 
-                    def _is_non_running(pod: V1Pod) -> bool:
+                    def _is_non_running(pod: AttrDict) -> bool:
                         phase = getattr(getattr(pod, "status", None), "phase", "")
                         return phase not in ("Running", "Succeeded")
 
@@ -2162,15 +1888,22 @@ def watch_pod_counts() -> None:
     )
     ns = choose_namespace()
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
-    v1 = client.CoreV1Api()
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                    pods = get_pods(v1, ns)
+                    pods, error, command_descriptor = get_pods(ns)
+                    if error:
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="Pod 정보를 가져오는",
+                            detail=error,
+                            snapshot_title="Pod Count Summary - Error",
+                        )
+                        tracker.tick()
+                        continue
                     total = len(pods)
                     normal = sum(
                         1
@@ -2195,11 +1928,6 @@ def watch_pod_counts() -> None:
                             ),
                         ),
                         border_style="blue",
-                    )
-                    command_descriptor = (
-                        "Python client: CoreV1Api.list_namespaced_pod"
-                        if ns
-                        else "Python client: CoreV1Api.list_pod_for_all_namespaces"
                     )
                     frame_key = _make_frame_key(
                         "data",
@@ -2245,14 +1973,9 @@ def watch_node_monitoring_by_creation() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    v1 = client.CoreV1Api()
-    command_descriptor = (
-        "Python client: CoreV1Api.list_node (sorted by creationTimestamp)"
+    label_selector = (
+        f"{NODE_GROUP_LABEL}={filter_nodegroup}" if filter_nodegroup else None
     )
-    if filter_nodegroup:
-        command_descriptor = (
-            f"{command_descriptor} (filter {NODE_GROUP_LABEL}={filter_nodegroup})"
-        )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -2260,90 +1983,14 @@ def watch_node_monitoring_by_creation() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                    try:
-                        response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
-                        nodes = list(getattr(response, "items", []) or [])
-                    except (
-                        MaxRetryError,
-                        ConnectTimeoutError,
-                        ReadTimeoutError,
-                        socket.timeout,
-                    ) as exc:
-                        message = (
-                            "노드 정보를 가져오는 중 API 응답이 지연되었습니다. "
-                            "네트워크 연결과 인증 상태를 확인하세요."
-                        )
-                        frame_key = _make_frame_key("timeout", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Node Monitoring (생성 순) - Timeout",
-                                status="warning",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="경고", style="bold yellow"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except ApiException as exc:
-                        status = getattr(exc, "status", "unknown")
-                        reason = getattr(exc, "reason", "")
-                        detail = getattr(exc, "body", "") or str(exc)
-                        message = (
-                            f"노드 목록을 조회하는 중 API 오류가 발생했습니다. "
-                            f"(HTTP {status} {reason})"
-                        )
-                        frame_key = _make_frame_key(
-                            "api_error", str(status), reason, detail
-                        )
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Node Monitoring (생성 순) - Error",
-                                status="error",
-                                body=f"{message}\n세부 정보: {detail}",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
-                        message = f"노드 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
-                        frame_key = _make_frame_key("unexpected_error", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Node Monitoring (생성 순) - Error",
-                                status="error",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                    nodes, error, command_descriptor = get_nodes(label_selector)
+                    if error:
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="Node 정보를 가져오는",
+                            detail=error,
+                            snapshot_title="Node Monitoring (생성 순) - Error",
                         )
                         tracker.tick()
                         continue
@@ -2493,12 +2140,9 @@ def watch_unhealthy_nodes() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    v1 = client.CoreV1Api()
-    command_descriptor = "Python client: CoreV1Api.list_node (exclude Ready)"
-    if filter_nodegroup:
-        command_descriptor = (
-            f"{command_descriptor} (filter {NODE_GROUP_LABEL}={filter_nodegroup})"
-        )
+    label_selector = (
+        f"{NODE_GROUP_LABEL}={filter_nodegroup}" if filter_nodegroup else None
+    )
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
     try:
@@ -2506,90 +2150,14 @@ def watch_unhealthy_nodes() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                    try:
-                        response = v1.list_node(_request_timeout=API_REQUEST_TIMEOUT)
-                        nodes = list(getattr(response, "items", []) or [])
-                    except (
-                        MaxRetryError,
-                        ConnectTimeoutError,
-                        ReadTimeoutError,
-                        socket.timeout,
-                    ) as exc:
-                        message = (
-                            "노드 정보를 가져오는 중 API 응답이 지연되었습니다. "
-                            "네트워크 연결과 인증 상태를 확인하세요."
-                        )
-                        frame_key = _make_frame_key("timeout", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Unhealthy Node - Timeout",
-                                status="warning",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="경고", style="bold yellow"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except ApiException as exc:
-                        status = getattr(exc, "status", "unknown")
-                        reason = getattr(exc, "reason", "")
-                        detail = getattr(exc, "body", "") or str(exc)
-                        message = (
-                            f"노드 목록을 조회하는 중 API 오류가 발생했습니다. "
-                            f"(HTTP {status} {reason})"
-                        )
-                        frame_key = _make_frame_key(
-                            "api_error", str(status), reason, detail
-                        )
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Unhealthy Node - Error",
-                                status="error",
-                                body=f"{message}\n세부 정보: {detail}",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
-                        )
-                        tracker.tick()
-                        continue
-                    except Exception as exc:  # pragma: no cover - 예기치 못한 오류
-                        message = f"노드 목록을 처리하는 중 예기치 못한 오류가 발생했습니다: {exc}"
-                        frame_key = _make_frame_key("unexpected_error", str(exc))
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Unhealthy Node - Error",
-                                status="error",
-                                body=message,
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(message, title="오류", style="bold red"),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                    nodes, error, command_descriptor = get_nodes(label_selector)
+                    if error:
+                        _handle_kubectl_fetch_error(
+                            tracker,
+                            command=command_descriptor,
+                            context="Node 정보를 가져오는",
+                            detail=error,
+                            snapshot_title="Unhealthy Node - Error",
                         )
                         tracker.tick()
                         continue
@@ -2890,10 +2458,9 @@ def watch_pod_resources() -> None:
     if filter_choice.startswith("y"):
         filter_nodegroup = choose_node_group() or ""
 
-    v1 = client.CoreV1Api()
     node_filter: Optional[Set[str]] = None
     if filter_nodegroup:
-        node_filter = _collect_nodes_for_group(v1, filter_nodegroup)
+        node_filter = _collect_nodes_for_group(filter_nodegroup)
         if not node_filter:
             console.print(
                 "선택한 NodeGroup에 해당하는 노드가 없습니다.", style="bold red"
@@ -2907,15 +2474,14 @@ def watch_pod_resources() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if reload_kube_config_if_changed():
-                        v1 = client.CoreV1Api()
-                        if filter_nodegroup:
-                            node_filter = _collect_nodes_for_group(v1, filter_nodegroup)
-                            if not node_filter:
-                                console.print(
-                                    "[bold red]NodeGroup 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
-                                )
-                                filter_nodegroup = ""  # Reset filter
+                    if filter_nodegroup:
+                        node_filter = _collect_nodes_for_group(filter_nodegroup)
+                        if not node_filter:
+                            console.print(
+                                "[bold red]NodeGroup 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
+                            )
+                            filter_nodegroup = ""
+                            node_filter = None
 
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
                     if error:
@@ -2970,7 +2536,7 @@ def watch_pod_resources() -> None:
                         tracker.tick()
                         continue
 
-                    pod_to_node = _map_pod_to_node(v1, namespace)
+                    pod_to_node = _map_pod_to_node(namespace)
 
                     enriched = []
                     for ns_name, pod_name, cpu_raw, mem_raw in metrics:
@@ -3158,8 +2724,6 @@ def main() -> None:
     if hasattr(signal, "SIGWINCH"):
         signal.signal(signal.SIGWINCH, handle_winch)
 
-    start_kube_config_watcher()
-    reload_kube_config_if_changed(force=True)  # 초기 강제 로드
     try:
         while True:
             choice = main_menu()

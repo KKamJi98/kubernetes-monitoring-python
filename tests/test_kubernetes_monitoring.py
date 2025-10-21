@@ -92,55 +92,28 @@ def test_get_kubectl_top_pod_failure(mock_run):
     assert command == "kubectl top pod --no-headers -A"
 
 
-@patch("kubernetes_monitoring.config")
-def test_reload_kube_config_success(mock_config):
-    """Test successful kube config reloading"""
-    mock_config.load_kube_config.return_value = None
-
-    # Should return True on success
-    result = kubernetes_monitoring.reload_kube_config_if_changed(force=True)
-    assert result is True
-    mock_config.load_kube_config.assert_called_once()
-
-
-@patch("kubernetes_monitoring.config")
-def test_reload_kube_config_failure(mock_config):
-    """Test kube config reloading failure"""
-    mock_config.load_kube_config.side_effect = Exception("Config error")
-
-    result = kubernetes_monitoring.reload_kube_config_if_changed(force=True)
-    assert result is False
-
-
 @patch("kubernetes_monitoring.Prompt.ask")
-@patch("kubernetes_monitoring.client")
-def test_choose_namespace_success(mock_client, mock_prompt):
+@patch("kubernetes_monitoring._run_kubectl_json")
+def test_choose_namespace_success(mock_run, mock_prompt):
     """Test successful namespace selection"""
-    # Mock the namespace list
-    mock_ns = MagicMock()
-    mock_ns.metadata.name = "test-namespace"
+    mock_namespace = MagicMock()
+    mock_metadata = MagicMock()
+    mock_metadata.name = "test-namespace"
+    mock_namespace.metadata = mock_metadata
+    payload = MagicMock()
+    payload.items = [mock_namespace]
+    mock_run.return_value = (payload, None, "kubectl get namespaces -o json")
 
-    mock_ns_list = MagicMock()
-    mock_ns_list.items = [mock_ns]
-
-    mock_v1 = MagicMock()
-    mock_v1.list_namespace.return_value = mock_ns_list
-    mock_client.CoreV1Api.return_value = mock_v1
-
-    # Mock user input (empty string for default/all namespaces)
     mock_prompt.return_value = ""
 
     # This should not raise an exception
     kubernetes_monitoring.choose_namespace()
 
 
-@patch("kubernetes_monitoring.client")
-def test_choose_namespace_failure(mock_client):
+@patch("kubernetes_monitoring._run_kubectl_json")
+def test_choose_namespace_failure(mock_run):
     """Test namespace selection failure"""
-    mock_v1 = MagicMock()
-    mock_v1.list_namespace.side_effect = Exception("API error")
-    mock_client.CoreV1Api.return_value = mock_v1
-
+    mock_run.return_value = (None, "API error", "kubectl get namespaces -o json")
     kubernetes_monitoring.choose_namespace()
 
 
