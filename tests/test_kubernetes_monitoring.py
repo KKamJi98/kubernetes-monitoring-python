@@ -114,8 +114,8 @@ def test_ready_ratio_computation_with_kubectl_payload():
     assert ready_display == "[1/2]"
 
 
-def test_extract_node_group_infos():
-    """NodeGroup 라벨 목록이 정렬 및 카운트된 정보를 반환한다."""
+def test_extract_node_label_infos():
+    """선택한 라벨 키 기준으로 노드 목록을 요약한다."""
     nodes_payload = [
         {
             "metadata": {
@@ -143,12 +143,48 @@ def test_extract_node_group_infos():
         },
     ]
     nodes = [kubernetes_monitoring._wrap_kubectl_value(item) for item in nodes_payload]
-    infos = kubernetes_monitoring._extract_node_group_infos(nodes)
+    label_key = kubernetes_monitoring.NODE_GROUP_LABEL
+    infos = kubernetes_monitoring._extract_node_label_infos(nodes, label_key)
     assert [info.value for info in infos] == ["group-1", "group-2"]
     group1 = infos[0]
+    assert group1.key == label_key
     assert group1.node_count == 2
     assert group1.nodes == ("node-a", "node-c")
-    assert group1.label == f"{kubernetes_monitoring.NODE_GROUP_LABEL}=group-1"
+    assert group1.label == f"{label_key}=group-1"
+
+
+def test_collect_node_label_key_infos():
+    """노드에서 발견된 라벨 키 목록을 수집한다."""
+    nodes_payload = [
+        {
+            "metadata": {
+                "name": "node-a",
+                "labels": {
+                    kubernetes_monitoring.NODE_GROUP_LABEL: "group-1",
+                    "topology.kubernetes.io/zone": "ap-northeast-2a",
+                },
+            }
+        },
+        {
+            "metadata": {
+                "name": "node-b",
+                "labels": {
+                    kubernetes_monitoring.NODE_GROUP_LABEL: "group-2",
+                    "beta.kubernetes.io/arch": "amd64",
+                },
+            }
+        },
+    ]
+    nodes = [kubernetes_monitoring._wrap_kubectl_value(item) for item in nodes_payload]
+    infos = kubernetes_monitoring._collect_node_label_key_infos(nodes)
+    keys = [info.key for info in infos]
+    assert kubernetes_monitoring.NODE_GROUP_LABEL in keys
+    assert "topology.kubernetes.io/zone" in keys
+    nodegroup_info = next(
+        info for info in infos if info.key == kubernetes_monitoring.NODE_GROUP_LABEL
+    )
+    assert nodegroup_info.node_count == 2
+    assert "group-1" in nodegroup_info.sample_values
 
 
 @patch("kubernetes_monitoring.subprocess.run")
