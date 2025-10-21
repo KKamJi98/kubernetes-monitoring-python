@@ -1308,11 +1308,16 @@ def choose_node_group() -> Optional[NodeLabelSelector]:
     table.add_column("Nodes", justify="right")
     table.add_column("Sample Values", overflow="fold")
     default_key_index = None
-    for idx, info in enumerate(key_infos, start=1):
-        if info.key == NODE_GROUP_LABEL and default_key_index is None:
+    for idx, label_info in enumerate(key_infos, start=1):
+        if label_info.key == NODE_GROUP_LABEL and default_key_index is None:
             default_key_index = idx
-        sample_values = ", ".join(info.sample_values) or "-"
-        table.add_row(str(idx), info.key, str(info.node_count), sample_values)
+        sample_values = ", ".join(label_info.sample_values) or "-"
+        table.add_row(
+            str(idx),
+            label_info.key,
+            str(label_info.node_count),
+            sample_values,
+        )
     console.print("\n=== Available Node Label Keys ===", style="bold green")
     console.print(table)
 
@@ -1342,16 +1347,16 @@ def choose_node_group() -> Optional[NodeLabelSelector]:
     value_table.add_column("Label", overflow="fold")
     value_table.add_column("Nodes", justify="right")
     value_table.add_column("Sample Nodes", overflow="fold")
-    for idx, info in enumerate(value_infos, start=1):
-        sample_nodes = ", ".join(info.nodes[:3])
-        if len(info.nodes) > 3:
+    for idx, group_info in enumerate(value_infos, start=1):
+        sample_nodes = ", ".join(group_info.nodes[:3])
+        if len(group_info.nodes) > 3:
             sample_nodes = f"{sample_nodes}, ..."
         if not sample_nodes:
             sample_nodes = "-"
         value_table.add_row(
             str(idx),
-            info.label,
-            str(info.node_count),
+            group_info.label,
+            str(group_info.node_count),
             sample_nodes,
         )
     console.print("\n=== Available Label Values ===", style="bold green")
