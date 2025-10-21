@@ -360,7 +360,7 @@ def _collect_node_label_key_infos(nodes: Sequence[AttrDict]) -> List[NodeLabelKe
     return sorted(infos, key=lambda info: info.key.lower())
 
 
-def _ensure_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+def _ensure_datetime(value: Optional[Any]) -> Optional[datetime.datetime]:
     """datetime 또는 ISO 문자열 입력을 UTC datetime으로 정규화."""
     if value is None:
         return None
@@ -368,7 +368,8 @@ def _ensure_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.da
         candidate = value
     else:
         try:
-            candidate = datetime.datetime.fromisoformat(str(value))
+            text = str(value).replace("Z", "+00:00")
+            candidate = datetime.datetime.fromisoformat(text)
         except ValueError:
             return None
     if candidate.tzinfo is None:
@@ -1455,15 +1456,26 @@ def get_pods(
 def get_nodes(
     label_selector: Optional[str] = None,
 ) -> Tuple[List[AttrDict], Optional[str], str]:
-    """노드 목록을 조회한다."""
+    """노드 목록을 조회한다 (필터 여부와 관계없이 전체를 가져와 메모리 캐시)."""
     args: List[str] = ["get", "nodes"]
-    if label_selector:
-        args.extend(["-l", label_selector])
     payload, error, command = _run_kubectl_json(args)
     if error or payload is None:
         return [], error or "kubectl이 빈 응답을 반환했습니다.", command
-    items = getattr(payload, "items", []) or []
-    return list(items), None, command
+    items = list(getattr(payload, "items", []) or [])
+    if label_selector:
+        key, _, value = label_selector.partition("=")
+        if value:
+            filtered = [
+                node
+                for node in items
+                if _label_value_from_mapping(
+                    getattr(getattr(node, "metadata", None), "labels", None),
+                    key,
+                )
+                == value
+            ]
+            return filtered, None, command
+    return items, None, command
 
 
 def _handle_kubectl_fetch_error(
