@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * Rename '재시작된 컨테이너 확인 및 로그 조회' menu to 'Container Monitoring (재시작된 컨테이너 및 로그)' for consistency.
 
+## [1.5.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.4.0...v1.5.0) (2025-10-21)
+
+
+### Features
+
+* **cli:** add live command input prompt ([84aff03](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/84aff03b7f997eddf413d2d57af5548c8f45cb6b))
+* **context:** auto-reload on kubeconfig change ([ddc6ea4](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/ddc6ea47eca10e2d2f19f0bffe698d3fc6b02ea6))
+* **export:** add csv export option ([3c04096](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/3c040965045c05410af4fe90d5789ba7a62584d9))
+* **filter:** support choosing node label keys ([786bf5d](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/786bf5d3292f13234dd8aef62008174c52e2a00b))
+* **ui:** annotate time headers with timezone ([5cea6f2](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/5cea6f2fd82b39c0511061eb156d5f36489496d4))
+* **ui:** display timestamps in kst timezone ([252b3ce](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/252b3ce5b1dee794fc196989c9a1abdf586afe22))
+* **ui:** handle terminal resize events ([fe57837](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/fe578371d136efedd79ea5ba9968433c9b36ab79))
+* **ui:** improve nodegroup filtering and readiness ([5628496](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/56284966722554a57f7fc25d837fb4b1ecc3e976))
+* **ui:** refine snapshot export and ready display ([05d3e84](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/05d3e840c43a14a0cabaa05df07e06747d74d56b))
+* **ui:** simplify live output and snapshot format ([1b05f52](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/1b05f52322023ee348ef65a0c8c0a1b8b62a86e3))
+
+
+### Bug Fixes
+
+* **attrdict:** guard integer lookups from raising ([3361c06](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/3361c06950d7485104994db1ddac6b8d87445510))
+* **ci:** resolve mypy and pytest errors ([941069d](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/941069de0894b1ebbb1a6128103be5eb43bd4bf4))
+* **ci:** resolve mypy and pytest errors ([79ead3f](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/79ead3f4fae066f3f6f6d7b00ad641760878ce2e))
+* **cli:** add timeouts for pod monitor requests ([049ac99](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/049ac99e54e9716ad07c70b11fc2416e2e0d837e))
+* **cli:** improve live input responsiveness ([053ffb7](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/053ffb766204d23b758a4d615eea9ce6df66c608))
+* **context:** remove non-existent cleanup_and_reset call ([61c9d91](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/61c9d9183539cab98c1865aedc42b7db2a4440e8))
+* **node:** handle non-string label keys safely ([b8fa676](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/b8fa676a3dfb918b1fcd4feeac74f74023edddfb))
+* **node:** resolve created-at parsing and reduce timeouts ([a3b6884](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/a3b68842b753c42787c3becf12babd0eb69f25dd))
+* **node:** show zone values and allow label-only selection ([e1792f6](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/e1792f68b7e39da36e548a326a0774b703749e19))
+* **node:** skip invalid role labels ([355820a](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/355820a1142738834c9d8fd0178c060d3c1e0385))
+* **pod-monitor:** balance restart and creation ordering ([fcb1018](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/fcb1018669947957f43f8d971a6b62f2dc55f75f))
+* **pod-monitor:** prioritize restarted pods in creation view ([9229283](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/922928323045aa2c108753618cb2c554e404793d))
+* **types:** normalize node zone label lookup ([2101289](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/21012899a4c0a681bce1465456b856e02c5e70d0))
+* **ui:** sync node label headers and menu text ([827c34e](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/827c34e3d478bb388b81ecf6b51a30d71d4f665c))
+* **ui:** wrap long resource names in live tables ([44aefc0](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/44aefc0f181429745b3e97d5ba476a6c3f2b8c3e))
+
+
+### Performance Improvements
+
+* **kubectl:** cache selector lookups and reuse node data ([f3be584](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/f3be584df817385a0b5593f7bd94c5b6d9493be9))
+* **pods:** cache kubectl responses and document tuning ([79b3df0](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/79b3df00c1dc492654fd3f8cc6dc952222a1b385))
+
+
+### Documentation
+
+* remove AGENTS.md ([b0053dc](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/b0053dc9775b679369789cc0dafbc3d0dff1ed54))
+
 ## [1.4.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.3.0...v1.4.0) (2025-10-03)
 
 
