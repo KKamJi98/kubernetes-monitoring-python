@@ -210,6 +210,19 @@ def test_collect_node_label_key_infos():
     assert "123" in {info.key for info in infos_extended}
 
 
+def test_node_label_selection_expression_optional():
+    """NodeLabelSelection은 값이 없으면 필터 표현식을 생성하지 않는다."""
+    selection = kubernetes_monitoring.NodeLabelSelection(key="topology.kubernetes.io/zone")
+    assert selection.expression is None
+    assert str(selection) == "topology.kubernetes.io/zone"
+    with_value = kubernetes_monitoring.NodeLabelSelection(
+        key="topology.kubernetes.io/zone",
+        value="ap-northeast-2a",
+    )
+    assert with_value.expression == "topology.kubernetes.io/zone=ap-northeast-2a"
+    assert str(with_value) == "topology.kubernetes.io/zone=ap-northeast-2a"
+
+
 def test_node_roles_handles_non_string_label_keys():
     """node-role 라벨이 아닌 값이나 비문자열 키가 있어도 안전하게 처리한다."""
     node_payload = {
@@ -230,7 +243,7 @@ def test_node_roles_handles_non_string_label_keys():
 def test_collect_nodes_for_selector_uses_cache(mock_run):
     """라벨 셀렉터 캐시가 타임아웃 시 이전 결과를 재사용한다."""
     kubernetes_monitoring._NODE_SELECTOR_CACHE.clear()
-    monkey_selector = kubernetes_monitoring.NodeLabelSelector(
+    monkey_selector = kubernetes_monitoring.NodeLabelSelection(
         key=kubernetes_monitoring.NODE_GROUP_LABEL,
         value="group-a",
     )

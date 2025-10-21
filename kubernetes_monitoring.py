@@ -63,7 +63,7 @@ LIVE_REFRESH_INTERVAL = 2.0  # seconds
 INPUT_POLL_INTERVAL = 0.05  # seconds
 COMMAND_INPUT_VISIBLE = False
 
-_NODE_SELECTOR_CACHE: Dict["NodeLabelSelector", Tuple[float, FrozenSet[str]]] = {}
+_NODE_SELECTOR_CACHE: Dict[str, Tuple[float, FrozenSet[str]]] = {}
 _NODE_SELECTOR_CACHE_TTL = float(os.getenv("KMP_NODE_CACHE_TTL", "10.0"))
 
 FrameKey = Tuple[str, Tuple[str, ...]]
@@ -275,18 +275,20 @@ class NodeLabelKeyInfo:
 
 
 @dataclass(frozen=True)
-class NodeLabelSelector:
-    """선택된 노드 라벨 key=value 표현."""
+class NodeLabelSelection:
+    """선택된 노드 라벨 key 및 선택적 value."""
 
     key: str
-    value: str
+    value: Optional[str] = None
 
     @property
-    def expression(self) -> str:
+    def expression(self) -> Optional[str]:
+        if self.value in (None, ""):
+            return None
         return f"{self.key}={self.value}"
 
     def __str__(self) -> str:
-        return self.expression
+        return self.expression or self.key
 
 
 def _normalize_labels_mapping(labels: Any) -> Dict[str, Any]:
@@ -469,13 +471,15 @@ def _node_roles(node: Any) -> str:
 
 def _node_zone(node: Any) -> str:
     """노드에 설정된 가용 영역 라벨을 반환."""
-    labels_raw = getattr(getattr(node, "metadata", None), "labels", None)
-    if not isinstance(labels_raw, dict):
+    labels = _normalize_labels_mapping(
+        getattr(getattr(node, "metadata", None), "labels", None)
+    )
+    if not labels:
         return "-"
 
-    zone_value = labels_raw.get("topology.kubernetes.io/zone")
+    zone_value = labels.get("topology.kubernetes.io/zone")
     if zone_value is None:
-        zone_value = labels_raw.get("failure-domain.beta.kubernetes.io/zone")
+        zone_value = labels.get("failure-domain.beta.kubernetes.io/zone")
 
     if zone_value is None:
         return "-"
@@ -1160,14 +1164,17 @@ def _map_pod_to_node(namespace: Optional[str] = None) -> Dict[Tuple[str, str], s
     return mapping
 
 
-def _collect_nodes_for_selector(selector: NodeLabelSelector) -> Set[str]:
+def _collect_nodes_for_selector(selection: NodeLabelSelection) -> Set[str]:
     """선택한 라벨 key=value에 속한 노드 이름 집합을 반환."""
+    expression = selection.expression
+    if not expression:
+        return set()
     now = time.monotonic()
-    cached = _NODE_SELECTOR_CACHE.get(selector)
+    cached = _NODE_SELECTOR_CACHE.get(expression)
     if cached and now - cached[0] <= _NODE_SELECTOR_CACHE_TTL:
         return set(cached[1])
 
-    payload, error, _ = _run_kubectl_json(["get", "nodes", "-l", selector.expression])
+    payload, error, _ = _run_kubectl_json(["get", "nodes", "-l", expression])
     if error or payload is None:
         if cached:
             return set(cached[1])
@@ -1178,7 +1185,7 @@ def _collect_nodes_for_selector(selector: NodeLabelSelector) -> Set[str]:
         name = getattr(metadata, "name", None)
         if name:
             result.add(str(name))
-    _NODE_SELECTOR_CACHE[selector] = (now, frozenset(result))
+    _NODE_SELECTOR_CACHE[expression] = (now, frozenset(result))
     return result
 
 
@@ -1305,10 +1312,10 @@ def _label_column_title(label_key: str) -> str:
     return "NodeGroup" if label_key == NODE_GROUP_LABEL else f"Label[{label_key}]"
 
 
-def choose_node_group() -> Optional[NodeLabelSelector]:
+def choose_node_group() -> Optional[NodeLabelSelection]:
     """
     클러스터 노드에서 사용할 라벨 키와 값을 선택한다.
-    선택된 key=value 쌍을 NodeLabelSelector로 반환하며, 아무 입력도 없으면 None.
+    선택된 key/value 조합을 NodeLabelSelection으로 반환하며, 값이 없으면 필터 없이 라벨만 표시한다.
     """
     payload, error, command = _run_kubectl_json(["get", "nodes"])
     if error or payload is None:
@@ -1365,8 +1372,11 @@ def choose_node_group() -> Optional[NodeLabelSelector]:
 
     value_infos = _extract_node_label_infos(nodes, chosen_key)
     if not value_infos:
-        print("선택한 라벨 키에 해당하는 값이 없습니다.")
-        return None
+        console.print(
+            f"{chosen_key} 라벨 키에 해당하는 값이 없습니다. 라벨만 표시합니다.",
+            style="bold yellow",
+        )
+        return NodeLabelSelection(key=chosen_key)
 
     value_table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     value_table.add_column("Index", style="bold green", width=5)
@@ -1392,7 +1402,11 @@ def choose_node_group() -> Optional[NodeLabelSelector]:
         "필터링할 라벨 값 번호를 선택하세요 (기본값: 선택 취소)", default=""
     ).strip()
     if not value_selection:
-        return None
+        console.print(
+            f"{chosen_key} 라벨을 필터 없이 표시합니다.",
+            style="bold green",
+        )
+        return NodeLabelSelection(key=chosen_key)
     if not value_selection.isdigit():
         print("숫자로 입력해주세요. 필터링하지 않음으로 진행합니다.")
         return None
@@ -1405,7 +1419,7 @@ def choose_node_group() -> Optional[NodeLabelSelector]:
         f"선택한 라벨: {chosen_info.label} (노드 {chosen_info.node_count}개)",
         style="bold green",
     )
-    return NodeLabelSelector(key=chosen_info.key, value=chosen_info.value)
+    return NodeLabelSelection(key=chosen_info.key, value=chosen_info.value)
 
 
 def get_tail_lines(prompt="몇 줄씩 확인할까요? (숫자 입력. default: 20줄): ") -> str:
@@ -2181,12 +2195,16 @@ def watch_node_monitoring_by_creation() -> None:
         .strip()
         .lower()
     )
-    filter_selector = choose_node_group() if filter_choice.startswith("y") else None
+    label_selection = choose_node_group() if filter_choice.startswith("y") else None
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    label_selector = filter_selector.expression if filter_selector else None
-    label_column_key = filter_selector.key if filter_selector else NODE_GROUP_LABEL
+    label_selector = (
+        label_selection.expression if label_selection else None
+    )
+    label_column_key = (
+        label_selection.key if label_selection else NODE_GROUP_LABEL
+    )
     label_column_title = _label_column_title(label_column_key)
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
@@ -2207,12 +2225,12 @@ def watch_node_monitoring_by_creation() -> None:
                         tracker.tick()
                         continue
 
-                    if filter_selector:
+                    if label_selection and label_selection.expression:
                         nodes = [
                             node
                             for node in nodes
-                            if _node_label_value(node, filter_selector.key)
-                            == filter_selector.value
+                            if _node_label_value(node, label_selection.key)
+                            == label_selection.value
                         ]
 
                     if not nodes:
@@ -2340,12 +2358,16 @@ def watch_unhealthy_nodes() -> None:
         .strip()
         .lower()
     )
-    filter_selector = choose_node_group() if filter_choice.startswith("y") else None
+    label_selection = choose_node_group() if filter_choice.startswith("y") else None
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    label_selector = filter_selector.expression if filter_selector else None
-    label_column_key = filter_selector.key if filter_selector else NODE_GROUP_LABEL
+    label_selector = (
+        label_selection.expression if label_selection else None
+    )
+    label_column_key = (
+        label_selection.key if label_selection else NODE_GROUP_LABEL
+    )
     label_column_title = _label_column_title(label_column_key)
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
@@ -2366,12 +2388,12 @@ def watch_unhealthy_nodes() -> None:
                         tracker.tick()
                         continue
 
-                    if filter_selector:
+                    if label_selection and label_selection.expression:
                         nodes = [
                             node
                             for node in nodes
-                            if _node_label_value(node, filter_selector.key)
-                            == filter_selector.value
+                            if _node_label_value(node, label_selection.key)
+                            == label_selection.value
                         ]
 
                     unhealthy = [
@@ -2523,10 +2545,13 @@ def watch_node_resources() -> None:
         .strip()
         .lower()
     )
-    filter_selector = choose_node_group() if filter_choice.startswith("y") else None
+    label_selection = choose_node_group() if filter_choice.startswith("y") else None
+    selector_expression = (
+        label_selection.expression if label_selection else None
+    )
 
-    if filter_selector:
-        base_cmd = f"kubectl top node -l {filter_selector.expression} --no-headers"
+    if selector_expression:
+        base_cmd = f"kubectl top node -l {selector_expression} --no-headers"
     else:
         base_cmd = "kubectl top node --no-headers"
 
@@ -2651,14 +2676,14 @@ def watch_pod_resources() -> None:
         .strip()
         .lower()
     )
-    filter_selector = choose_node_group() if filter_choice.startswith("y") else None
+    label_selection = choose_node_group() if filter_choice.startswith("y") else None
 
     node_filter: Optional[Set[str]] = None
-    if filter_selector:
-        node_filter = _collect_nodes_for_selector(filter_selector)
+    if label_selection and label_selection.expression:
+        node_filter = _collect_nodes_for_selector(label_selection)
         if not node_filter:
             console.print(
-                f"선택한 라벨 {filter_selector} 에 해당하는 노드가 없습니다.",
+                f"선택한 라벨 {label_selection} 에 해당하는 노드가 없습니다.",
                 style="bold red",
             )
             return
@@ -2670,13 +2695,13 @@ def watch_pod_resources() -> None:
             with Live(console=console, auto_refresh=False) as live:
                 tracker = LiveFrameTracker(live)
                 while True:
-                    if filter_selector:
-                        node_filter = _collect_nodes_for_selector(filter_selector)
+                    if label_selection and label_selection.expression:
+                        node_filter = _collect_nodes_for_selector(label_selection)
                         if not node_filter:
                             console.print(
                                 "[bold red]라벨 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
                             )
-                            filter_selector = None
+                            label_selection = None
                             node_filter = None
 
                     metrics, error, kubectl_cmd = _get_kubectl_top_pod(namespace)
