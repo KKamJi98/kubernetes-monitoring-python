@@ -49,6 +49,30 @@ def test_format_ready_ratio():
     assert kubernetes_monitoring._format_ready_ratio(3, 2) == "[2/2]"
 
 
+def test_select_tail_sorted_reduces_full_sort():
+    """부분 정렬 유틸리티는 tail 개수만큼만 오름차순으로 반환한다."""
+    values = [5, 1, 3, 2, 4]
+    result = kubernetes_monitoring._select_tail_sorted(
+        values,
+        2,
+        key=lambda value: value,
+    )
+    assert result == [4, 5]
+    assert kubernetes_monitoring._select_tail_sorted(
+        values,
+        10,
+        key=lambda value: value,
+    ) == sorted(values)
+    assert (
+        kubernetes_monitoring._select_tail_sorted(
+            values,
+            0,
+            key=lambda value: value,
+        )
+        == []
+    )
+
+
 def test_attrdict_missing_key_returns_none():
     """AttrDict는 존재하지 않는 키 조회 시 None을 반환한다."""
     wrapped = kubernetes_monitoring.AttrDict({"CamelCase": "value"})
@@ -121,6 +145,87 @@ def test_ready_ratio_computation_with_kubectl_payload():
         ready_count, total_containers
     )
     assert ready_display == "[1/2]"
+
+
+def test_summarize_pod_containers_last_restart_time():
+    """재시작 종료 시각이 summary에 기록된다."""
+    pod_payload = {
+        "metadata": {"creationTimestamp": "2024-01-01T00:00:00Z"},
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restartCount": 2,
+                    "lastState": {"terminated": {"finishedAt": "2024-02-01T00:05:00Z"}},
+                    "state": {"terminated": {"finishedAt": "2024-02-01T00:10:00Z"}},
+                },
+                {
+                    "name": "sidecar",
+                    "ready": True,
+                    "restartCount": 1,
+                },
+            ]
+        },
+        "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
+    }
+    pod = kubernetes_monitoring._wrap_kubectl_value(pod_payload)
+    summary = kubernetes_monitoring._summarize_pod_containers(pod)
+    assert summary.restarts == 3
+    expected = kubernetes_monitoring._ensure_datetime("2024-02-01T00:10:00Z")
+    assert summary.last_restart_at == expected
+
+
+def test_prioritize_pods_for_creation_monitor_prefers_restarts():
+    """재시작된 Pod가 최신 생성 Pod보다 우선 정렬된다."""
+    restarted_pod = kubernetes_monitoring._wrap_kubectl_value(
+        {
+            "metadata": {
+                "name": "restarted",
+                "namespace": "default",
+                "creationTimestamp": "2024-01-01T00:00:00Z",
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.1",
+                "containerStatuses": [
+                    {
+                        "name": "app",
+                        "ready": True,
+                        "restartCount": 3,
+                        "lastState": {
+                            "terminated": {"finishedAt": "2024-05-01T03:00:00Z"}
+                        },
+                    }
+                ],
+            },
+            "spec": {"containers": [{"name": "app"}], "nodeName": "node-a"},
+        }
+    )
+    fresh_pod = kubernetes_monitoring._wrap_kubectl_value(
+        {
+            "metadata": {
+                "name": "fresh",
+                "namespace": "default",
+                "creationTimestamp": "2024-06-01T00:00:00Z",
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.2",
+                "containerStatuses": [
+                    {"name": "app", "ready": True, "restartCount": 0}
+                ],
+            },
+            "spec": {"containers": [{"name": "app"}], "nodeName": "node-b"},
+        }
+    )
+    prioritized = kubernetes_monitoring._prioritize_pods_for_creation_monitor(
+        [fresh_pod, restarted_pod]
+    )
+    assert [entry.pod_name for entry in prioritized] == ["restarted", "fresh"]
+    expected_activity = kubernetes_monitoring._ensure_datetime("2024-05-01T03:00:00Z")
+    assert prioritized[0].activity_timestamp == expected_activity
+    assert prioritized[0].summary.restarts == 3
 
 
 def test_extract_node_label_infos():
@@ -214,7 +319,9 @@ def test_collect_node_label_key_infos():
 
 def test_node_label_selection_expression_optional():
     """NodeLabelSelection은 값이 없으면 필터 표현식을 생성하지 않는다."""
-    selection = kubernetes_monitoring.NodeLabelSelection(key="topology.kubernetes.io/zone")
+    selection = kubernetes_monitoring.NodeLabelSelection(
+        key="topology.kubernetes.io/zone"
+    )
     assert selection.expression is None
     assert str(selection) == "topology.kubernetes.io/zone"
     with_value = kubernetes_monitoring.NodeLabelSelection(
@@ -284,7 +391,9 @@ def test_run_kubectl_json_cache_reuses_payload(monkeypatch):
     def fake_monotonic() -> float:
         return float(next(times))
 
-    monkeypatch.setattr(kubernetes_monitoring.time, "monotonic", fake_monotonic, raising=False)
+    monkeypatch.setattr(
+        kubernetes_monitoring.time, "monotonic", fake_monotonic, raising=False
+    )
 
     call_counter = {"count": 0}
 
@@ -294,7 +403,9 @@ def test_run_kubectl_json_cache_reuses_payload(monkeypatch):
             return SimpleNamespace(returncode=0, stdout="{}", stderr="")
         raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
 
-    monkeypatch.setattr(kubernetes_monitoring.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(
+        kubernetes_monitoring.subprocess, "run", fake_run, raising=False
+    )
 
     payload1, error1, _ = kubernetes_monitoring._run_kubectl_json(["get", "pods"])
     assert error1 is None

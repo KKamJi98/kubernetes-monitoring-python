@@ -3,6 +3,7 @@
 import contextlib
 import csv
 import datetime
+import heapq
 import json
 import os
 import shlex
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     FrozenSet,
     Iterator,
@@ -25,6 +27,7 @@ from typing import (
     Set,
     Tuple,
     TypedDict,
+    TypeVar,
     cast,
 )
 
@@ -50,6 +53,7 @@ except ValueError:
 console = Console()
 
 TERMINAL_RESIZED = False
+UTC_MIN = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
 def handle_winch(signum: int, frame: Any) -> None:
@@ -78,6 +82,7 @@ _KUBECTL_JSON_CACHE: Dict[Tuple[str, ...], Tuple[float, Any, Optional[str]]] = {
 _NODE_SELECTOR_CACHE_TTL = float(os.getenv("KMP_NODE_CACHE_TTL", "10.0"))
 
 FrameKey = Tuple[str, Tuple[str, ...]]
+_T = TypeVar("_T")
 
 if TYPE_CHECKING:
 
@@ -198,7 +203,11 @@ def _run_kubectl_json(
         payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
         if cacheable and cached_payload is not None:
-            _KUBECTL_JSON_CACHE[cache_key] = (time.monotonic(), cached_payload, str(exc))
+            _KUBECTL_JSON_CACHE[cache_key] = (
+                time.monotonic(),
+                cached_payload,
+                str(exc),
+            )
             return cached_payload, f"kubectl JSON decode error: {exc}", command_str
         return None, f"kubectl JSON decode error: {exc}", command_str
     wrapped = _wrap_kubectl_value(payload)
@@ -219,6 +228,21 @@ def _clear_input_display() -> None:
 
 def _make_frame_key(tag: str, *parts: str) -> FrameKey:
     return (tag, tuple(parts))
+
+
+def _select_tail_sorted(
+    items: Sequence[_T],
+    limit: int,
+    *,
+    key: Callable[[_T], Any],
+) -> List[_T]:
+    """큰 key 순으로 상위 limit개를 오름차순으로 반환."""
+    if limit <= 0:
+        return []
+    if limit >= len(items):
+        return sorted(items, key=key)
+    largest = heapq.nlargest(limit, items, key=key)
+    return sorted(largest, key=key)
 
 
 class PodUsageRecord(TypedDict):
@@ -257,6 +281,30 @@ class PodContainerSummary:
     ready: int
     total: int
     restarts: int
+    last_restart_at: Optional[datetime.datetime] = None
+
+
+@dataclass(frozen=True)
+class PodMonitorPriority:
+    """Pod Monitoring (생성 순) 테이블 정렬용 메타데이터."""
+
+    pod: AttrDict
+    summary: PodContainerSummary
+    created_at: Optional[datetime.datetime]
+    last_restart_at: Optional[datetime.datetime]
+    namespace: str
+    pod_name: str
+
+    @property
+    def restart_flag(self) -> int:
+        return 1 if self.summary.restarts > 0 else 0
+
+    @property
+    def activity_timestamp(self) -> datetime.datetime:
+        """재시작 시각이 있으면 우선시하고, 없으면 생성 시각 기반으로 정렬."""
+        created = self.created_at or UTC_MIN
+        last_restart = self.last_restart_at or created
+        return last_restart
 
 
 @dataclass(frozen=True)
@@ -287,10 +335,68 @@ def _summarize_pod_containers(pod: AttrDict) -> PodContainerSummary:
         if container_statuses
         else len(getattr(spec, "containers", []) or [])
     )
-    restarts = sum(
-        int(getattr(item, "restart_count", 0)) for item in container_statuses
+    restarts = 0
+    latest_restart: Optional[datetime.datetime] = None
+
+    for item in container_statuses:
+        restarts += int(getattr(item, "restart_count", 0))
+
+        last_state = getattr(item, "last_state", None)
+        terminated = getattr(last_state, "terminated", None)
+        finished_at = _ensure_datetime(getattr(terminated, "finished_at", None))
+        if finished_at and (latest_restart is None or finished_at > latest_restart):
+            latest_restart = finished_at
+
+        state = getattr(item, "state", None)
+        current_terminated = getattr(state, "terminated", None)
+        current_finished = _ensure_datetime(
+            getattr(current_terminated, "finished_at", None)
+        )
+        if current_finished and (
+            latest_restart is None or current_finished > latest_restart
+        ):
+            latest_restart = current_finished
+
+    return PodContainerSummary(
+        ready=ready,
+        total=total,
+        restarts=restarts,
+        last_restart_at=latest_restart,
     )
-    return PodContainerSummary(ready=ready, total=total, restarts=restarts)
+
+
+def _prioritize_pods_for_creation_monitor(
+    pods: Sequence[AttrDict],
+) -> List[PodMonitorPriority]:
+    """재시작된 Pod를 우선적으로 노출하기 위한 정렬 메타데이터를 생성."""
+    priorities: List[PodMonitorPriority] = []
+    for pod in pods:
+        metadata = getattr(pod, "metadata", None)
+        created_at = _ensure_datetime(getattr(metadata, "creation_timestamp", None))
+        summary = _summarize_pod_containers(pod)
+        namespace = getattr(metadata, "namespace", "") or ""
+        pod_name = getattr(metadata, "name", "") or ""
+        priorities.append(
+            PodMonitorPriority(
+                pod=pod,
+                summary=summary,
+                created_at=created_at,
+                last_restart_at=summary.last_restart_at,
+                namespace=namespace,
+                pod_name=pod_name,
+            )
+        )
+    priorities.sort(
+        key=lambda entry: (
+            entry.restart_flag,
+            entry.activity_timestamp,
+            entry.summary.restarts,
+            entry.namespace,
+            entry.pod_name,
+        ),
+        reverse=True,
+    )
+    return priorities
 
 
 @dataclass(frozen=True)
@@ -408,7 +514,12 @@ def _ensure_datetime(value: Optional[Any]) -> Optional[datetime.datetime]:
 _DISPLAY_TIME_DELTA = datetime.timedelta(hours=9)
 _DISPLAY_TIMEZONE = datetime.timezone(_DISPLAY_TIME_DELTA, name="KST")
 _TIMEZONE_LABEL = "KST"
-_TIME_AWARE_HEADERS = {"LastSeen", "CreatedAt", "LastTerminatedTime"}
+_TIME_AWARE_HEADERS = {
+    "LastSeen",
+    "CreatedAt",
+    "LastTerminatedTime",
+    "LastRestartAt",
+}
 
 
 def _format_timestamp(value: Optional[datetime.datetime]) -> str:
@@ -1617,12 +1728,11 @@ def watch_event_monitoring() -> None:
                         tracker.tick()
                         continue
 
-                    sorted_items = sorted(
+                    selected = _select_tail_sorted(
                         items,
-                        key=lambda event: _event_timestamp(event)
-                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                        tail_limit,
+                        key=lambda event: _event_timestamp(event) or UTC_MIN,
                     )
-                    selected = sorted_items[-tail_limit:]
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
                     )
@@ -1855,18 +1965,8 @@ def watch_pod_monitoring_by_creation() -> None:
                         tracker.tick()
                         continue
 
-                    sorted_pods = sorted(
-                        pods,
-                        key=lambda pod: _ensure_datetime(
-                            getattr(
-                                getattr(pod, "metadata", None),
-                                "creation_timestamp",
-                                None,
-                            )
-                        )
-                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
-                    )
-                    selected = sorted_pods[-tail_limit:]
+                    prioritized = _prioritize_pods_for_creation_monitor(pods)
+                    selected = prioritized[:tail_limit]
 
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
@@ -1880,6 +1980,7 @@ def watch_pod_monitoring_by_creation() -> None:
                     table.add_column("Ready")
                     table.add_column("Status")
                     table.add_column("Restarts", justify="right")
+                    table.add_column(_label_time_header("LastRestartAt"))
                     table.add_column(_label_time_header("CreatedAt"))
                     if show_extra:
                         table.add_column("PodIP")
@@ -1887,17 +1988,16 @@ def watch_pod_monitoring_by_creation() -> None:
 
                     markdown_rows: List[List[str]] = []
                     frame_parts: List[str] = []
-                    for pod in selected:
-                        metadata = getattr(pod, "metadata", None)
+                    for entry in selected:
+                        pod = entry.pod
                         status = getattr(pod, "status", None)
                         spec = getattr(pod, "spec", None)
 
-                        namespace = getattr(metadata, "namespace", "-") or "-"
-                        name = getattr(metadata, "name", "-") or "-"
-                        creation = _format_timestamp(
-                            getattr(metadata, "creation_timestamp", None)
-                        )
-                        summary = _summarize_pod_containers(pod)
+                        namespace = entry.namespace or "-"
+                        name = entry.pod_name or "-"
+                        creation = _format_timestamp(entry.created_at)
+                        summary = entry.summary
+                        last_restart = _format_timestamp(entry.last_restart_at)
                         ready_display = _format_ready_ratio(
                             summary.ready,
                             summary.total,
@@ -1916,6 +2016,7 @@ def watch_pod_monitoring_by_creation() -> None:
                                 ready_display,
                                 phase,
                                 str(restarts),
+                                last_restart,
                                 creation,
                             ]
                         )
@@ -1946,10 +2047,18 @@ def watch_pod_monitoring_by_creation() -> None:
                             "Ready",
                             "Status",
                             "Restarts",
+                            "LastRestartAt",
                             "CreatedAt",
                         ]
                         if include_namespace
-                        else ["Name", "Ready", "Status", "Restarts", "CreatedAt"]
+                        else [
+                            "Name",
+                            "Ready",
+                            "Status",
+                            "Restarts",
+                            "LastRestartAt",
+                            "CreatedAt",
+                        ]
                     )
                     if show_extra:
                         headers.extend(["PodIP", "Node"])
@@ -2040,13 +2149,13 @@ def watch_non_running_pod() -> None:
                         tracker.tick()
                         continue
 
-                    sorted_filtered = sorted(
+                    selected = _select_tail_sorted(
                         filtered,
+                        tail_limit,
                         key=lambda pod: (
                             getattr(getattr(pod, "metadata", None), "name", "") or ""
                         ),
                     )
-                    selected = sorted_filtered[-tail_limit:]
 
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
@@ -2240,12 +2349,8 @@ def watch_node_monitoring_by_creation() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    label_selector = (
-        label_selection.expression if label_selection else None
-    )
-    label_column_key = (
-        label_selection.key if label_selection else NODE_GROUP_LABEL
-    )
+    label_selector = label_selection.expression if label_selection else None
+    label_column_key = label_selection.key if label_selection else NODE_GROUP_LABEL
     label_column_title = _label_column_title(label_column_key)
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
@@ -2300,8 +2405,9 @@ def watch_node_monitoring_by_creation() -> None:
                         tracker.tick()
                         continue
 
-                    sorted_nodes = sorted(
+                    selected = _select_tail_sorted(
                         nodes,
+                        tail_limit,
                         key=lambda node: _ensure_datetime(
                             getattr(
                                 getattr(node, "metadata", None),
@@ -2309,9 +2415,8 @@ def watch_node_monitoring_by_creation() -> None:
                                 None,
                             )
                         )
-                        or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                        or UTC_MIN,
                     )
-                    selected = sorted_nodes[-tail_limit:]
 
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
@@ -2399,12 +2504,8 @@ def watch_unhealthy_nodes() -> None:
     tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    label_selector = (
-        label_selection.expression if label_selection else None
-    )
-    label_column_key = (
-        label_selection.key if label_selection else NODE_GROUP_LABEL
-    )
+    label_selector = label_selection.expression if label_selection else None
+    label_column_key = label_selection.key if label_selection else NODE_GROUP_LABEL
     label_column_title = _label_column_title(label_column_key)
     console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
 
@@ -2462,14 +2563,14 @@ def watch_unhealthy_nodes() -> None:
                         tracker.tick()
                         continue
 
-                    sorted_nodes = sorted(
+                    selected = _select_tail_sorted(
                         unhealthy,
+                        tail_limit,
                         key=lambda node: getattr(
                             getattr(node, "metadata", None), "name", ""
                         )
                         or "",
                     )
-                    selected = sorted_nodes[-tail_limit:]
 
                     table = Table(
                         show_header=True, header_style="bold magenta", box=box.ROUNDED
@@ -2583,9 +2684,7 @@ def watch_node_resources() -> None:
         .lower()
     )
     label_selection = choose_node_group() if filter_choice.startswith("y") else None
-    selector_expression = (
-        label_selection.expression if label_selection else None
-    )
+    selector_expression = label_selection.expression if label_selection else None
 
     if selector_expression:
         base_cmd = f"kubectl top node -l {selector_expression} --no-headers"
