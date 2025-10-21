@@ -19,12 +19,13 @@ Kubernetes 클러스터에서 이벤트, Pod, Node 상태 등을 빠르게 확�
 
 3. **Pod Monitoring**
    - 생성된 순서, Running이 아닌 Pod, 전체/정상/비정상 Pod 개수를 조회
-   - CPU/Memory 사용량 기준 상위 Pod를 실시간으로 확인하며 NodeGroup 필터링 가능
+   - CPU/Memory 사용량 기준 상위 Pod를 실시간으로 확인하며 노드 라벨 기반 필터링을 지원
    - Ready 지표는 `[ready/total]` 형태로 고정돼 스프레드시트에서 날짜로 변환되지 않음
 
 4. **Node Monitoring**
    - 생성된 순서(노드 정보), Unhealthy Node, CPU/Memory 사용량이 높은 노드를 확인
-   - 모든 뷰에서 NodeGroup(라벨 기반) 필터링을 지원하고, UI는 노드 지표만 출력
+   - 라벨 키만 선택하거나 특정 값으로 필터링할 수 있으며, Zone/버전 정보를 함께 출력
+   - 반복적인 `kubectl` 호출은 내부 캐시로 완화해 타임아웃 발생 가능성을 줄임
 
 ## Requirements
 
@@ -113,10 +114,11 @@ or
 alias kmp="python -u /usr/local/bin/kubernetes_monitoring.py"
 ```
 
-## NodeGroup 라벨 커스터마이징
+## 기본 노드 라벨 커스터마이징
 
-- 스크립트 최상단에 있는 `NODE_GROUP_LABEL` 변수를 통해 NodeGroup 라벨 키를 쉽게 변경할 수 있습니다.
-- 기본값은 `"node.kubernetes.io/app"`로 설정되어 있으며, EKS 환경에서 NodeGroup 구분 시 흔히 사용하는 라벨입니다.
+- 스크립트 최상단에 있는 `NODE_GROUP_LABEL` 변수를 통해 기본 표시 라벨 키를 손쉽게 변경할 수 있습니다.
+- 기본값은 `"node.kubernetes.io/app"`로 설정되어 있으며, EKS 환경에서 노드 그룹을 구분할 때 흔히 사용하는 라벨입니다.
+- 메뉴에서 다른 라벨 키를 선택해도 컬럼에 값이 표시되며, 특정 값을 고르면 필터까지 적용됩니다.
 
 ```python
 NODE_GROUP_LABEL = "node.kubernetes.io/app"
@@ -134,10 +136,10 @@ Kubernetes Monitoring Tool
 │ 3 │ Pod Monitoring (생성된 순서) [옵션: Pod IP 및 Node Name 표시]                     │
 │ 4 │ Pod Monitoring (Running이 아닌 Pod) [옵션: Pod IP 및 Node Name 표시]              │
 │ 5 │ Pod Monitoring (전체/정상/비정상 Pod 개수 출력)                                   │
-│ 6 │ Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]           │
-│ 7 │ Node Monitoring (생성된 순서) [AZ, NodeGroup 표시 및 필터링 가능]                 │
-│ 8 │ Node Monitoring (Unhealthy Node 확인) [AZ, NodeGroup 표시 및 필터링 가능]         │
-│ 9 │ Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [NodeGroup 필터링 가능]          │
+│ 6 │ Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]           │
+│ 7 │ Node Monitoring (생성된 순서) [AZ, 선택 라벨 표시 및 필터링 가능]                 │
+│ 8 │ Node Monitoring (Unhealthy Node 확인) [AZ, 선택 라벨 표시 및 필터링 가능]         │
+│ 9 │ Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]          │
 │ Q │ Quit                                                                              │
 ╰───┴───────────────────────────────────────────────────────────────────────────────────╯
 ```
@@ -175,7 +177,8 @@ Kubernetes Monitoring Tool
 
 ### 3. Pod Monitoring (생성된 순서)
 
-- `kubectl get po ... --sort-by=.metadata.creationTimestamp` 명령을 2초 간격으로 실행하여 최신 생성 순서를 확인
+- `kubectl get po ... --chunk-size=0`를 2초 간격으로 실행하여 최신 생성 순서를 확인
+- 내부 캐시로 동일 주기에 중복 호출되지 않아 대규모 클러스터에서도 타임아웃을 줄입니다.
 - Ready 컬럼은 `[ready/total]` 형태로 노출되어 스프레드시트 자동 변환을 방지
 
 ### 4. Pod Monitoring (Running이 아닌 Pod 확인)
@@ -191,17 +194,19 @@ Kubernetes Monitoring Tool
 ### 6. Pod Monitoring (CPU/Memory 사용량 높은 순 정렬)
 
 - `kubectl top pod` 결과를 2초마다 조회하고 CPU/Memory 기준으로 정렬하여 상위 N개 Pod를 표시
-- NodeGroup 라벨 기반 필터링을 지원하며, Ready 컬럼은 `[ready/total]` 형태로 출력
+- 노드 라벨을 선택하면 해당 값을 가진 노드만 필터링하며, 라벨 값 미입력 시 컬럼만 표시합니다.
+- 내부 셀렉터 캐시를 사용해 같은 라벨의 노드 목록을 반복 조회하지 않습니다.
 
 ### 7. Node Monitoring (생성된 순서)
 
-- 노드 생성 시간(`.metadata.creationTimestamp`) 기준으로 정렬된 목록을 2초마다 재조회
-- Zone(`topology.ebs.csi.aws.com/zone`)와 NodeGroup(`NODE_GROUP_LABEL`)을 함께 출력
+- 노드 생성 시간(`.metadata.creationTimestamp`) 기준으로 정렬된 목록을 2초마다 재조회하며, `--chunk-size=0` 옵션으로 네트워크 오버헤드를 낮춥니다.
+- 라벨 키만 선택하거나 특정 값을 골라 필터링할 수 있으며, Zone과 Kubernetes 버전을 함께 표시합니다.
+- 동일 명령 반복 호출은 글로벌 캐시를 통해 조절되어 타임아웃 발생을 최소화합니다.
 
 ### 8. Node Monitoring (Unhealthy Node 확인)
 
-- `kubectl get nodes ... | grep -ivE ' Ready '` 명령을 2초마다 실행하여 Ready가 아닌 노드만 필터링
-- NodeGroup 필터링을 지원하며, 건강 상태와 라벨 정보를 함께 제공
+- Ready 상태가 아닌 노드만 필터링하여 표시하며, 라벨 선택 및 컬럼 표시 동작은 생성순 뷰와 동일합니다.
+- 캐시된 노드 데이터로 반복 호출 부담을 줄이면서도 비정상 노드 여부는 즉시 확인할 수 있습니다.
 
 ### 9. Node Monitoring (CPU/Memory 사용량 높은 순 정렬)
 
@@ -218,6 +223,16 @@ Kubernetes Monitoring Tool
   uv pip install .
   uv pip install ".[dev]"
   ```
+
+## 환경 변수 (Optional)
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `KMP_API_TIMEOUT` | `10.0` | `kubectl` JSON 호출 기본 타임아웃(초) |
+| `KMP_NODE_CACHE_TTL` | `10.0` | 노드 라벨 셀렉터 결과를 재사용하는 캐시 TTL(초) |
+| `KMP_KUBECTL_CACHE_TTL` | `1.5` | 동일 `kubectl get` 명령을 재사용하는 글로벌 캐시 TTL(초) |
+
+> `KMP_KUBECTL_CACHE_TTL`을 0 이하로 설정하면 캐시가 비활성화됩니다. 대규모 클러스터에서 타임아웃이 잦다면 TTL을 조정해보세요.
 
 - 포매팅(ruff):
 

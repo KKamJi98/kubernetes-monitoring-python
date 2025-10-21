@@ -37,6 +37,16 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
+try:
+    API_REQUEST_TIMEOUT = float(os.getenv("KMP_API_TIMEOUT", "10.0"))
+except ValueError:
+    API_REQUEST_TIMEOUT = 10.0
+
+try:
+    _KUBECTL_CACHE_TTL = float(os.getenv("KMP_KUBECTL_CACHE_TTL", "1.5"))
+except ValueError:
+    _KUBECTL_CACHE_TTL = 0.0
+
 console = Console()
 
 TERMINAL_RESIZED = False
@@ -64,14 +74,10 @@ INPUT_POLL_INTERVAL = 0.05  # seconds
 COMMAND_INPUT_VISIBLE = False
 
 _NODE_SELECTOR_CACHE: Dict[str, Tuple[float, FrozenSet[str]]] = {}
+_KUBECTL_JSON_CACHE: Dict[Tuple[str, ...], Tuple[float, Any, Optional[str]]] = {}
 _NODE_SELECTOR_CACHE_TTL = float(os.getenv("KMP_NODE_CACHE_TTL", "10.0"))
 
 FrameKey = Tuple[str, Tuple[str, ...]]
-
-try:
-    API_REQUEST_TIMEOUT = float(os.getenv("KMP_API_TIMEOUT", "10.0"))
-except ValueError:
-    API_REQUEST_TIMEOUT = 10.0
 
 if TYPE_CHECKING:
 
@@ -149,11 +155,22 @@ def _wrap_kubectl_value(value: Any) -> Any:
 
 
 def _run_kubectl_json(
-    args: Sequence[str], *, timeout: float = API_REQUEST_TIMEOUT
+    args: Sequence[str], *, timeout: float = API_REQUEST_TIMEOUT, cacheable: bool = True
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """kubectl 명령을 JSON 출력으로 실행한 뒤 결과를 AttrDict로 감싼다."""
     command = ["kubectl", *args, "-o", "json"]
     command_str = shlex.join(command)
+    cache_key = tuple(command)
+    cached_payload: Optional[Any] = None
+    cached_error: Optional[str] = None
+    if cacheable and _KUBECTL_CACHE_TTL > 0:
+        cached_entry = _KUBECTL_JSON_CACHE.get(cache_key)
+        if cached_entry:
+            cached_time, payload_obj, error_text = cached_entry
+            if time.monotonic() - cached_time <= _KUBECTL_CACHE_TTL:
+                return payload_obj, error_text, command_str
+            cached_payload = payload_obj
+            cached_error = error_text
     try:
         completed = subprocess.run(
             command,
@@ -164,6 +181,8 @@ def _run_kubectl_json(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        if cacheable and cached_payload is not None:
+            return cached_payload, cached_error, command_str
         return None, "kubectl command timed out.", command_str
     if completed.returncode != 0:
         error = (
@@ -171,12 +190,21 @@ def _run_kubectl_json(
             or completed.stdout.strip()
             or "kubectl command failed."
         )
+        if cacheable and cached_payload is not None:
+            _KUBECTL_JSON_CACHE[cache_key] = (time.monotonic(), cached_payload, error)
+            return cached_payload, error, command_str
         return None, error, command_str
     try:
         payload = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
+        if cacheable and cached_payload is not None:
+            _KUBECTL_JSON_CACHE[cache_key] = (time.monotonic(), cached_payload, str(exc))
+            return cached_payload, f"kubectl JSON decode error: {exc}", command_str
         return None, f"kubectl JSON decode error: {exc}", command_str
-    return _wrap_kubectl_value(payload), None, command_str
+    wrapped = _wrap_kubectl_value(payload)
+    if cacheable and _KUBECTL_CACHE_TTL > 0:
+        _KUBECTL_JSON_CACHE[cache_key] = (time.monotonic(), wrapped, None)
+    return wrapped, None, command_str
 
 
 def _set_input_display(text: str) -> None:
@@ -1446,6 +1474,7 @@ def get_pods(
         args.extend(["-n", namespace])
     else:
         args.append("-A")
+    args.extend(["--chunk-size=0"])
     payload, error, command = _run_kubectl_json(args)
     if error or payload is None:
         return [], error or "kubectl이 빈 응답을 반환했습니다.", command
@@ -1457,7 +1486,7 @@ def get_nodes(
     label_selector: Optional[str] = None,
 ) -> Tuple[List[AttrDict], Optional[str], str]:
     """노드 목록을 조회한다 (필터 여부와 관계없이 전체를 가져와 메모리 캐시)."""
-    args: List[str] = ["get", "nodes"]
+    args: List[str] = ["get", "nodes", "--chunk-size=0"]
     payload, error, command = _run_kubectl_json(args)
     if error or payload is None:
         return [], error or "kubectl이 빈 응답을 반환했습니다.", command

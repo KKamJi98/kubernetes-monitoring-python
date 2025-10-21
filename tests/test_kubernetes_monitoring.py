@@ -1,7 +1,9 @@
 import os
+import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Sequence, cast
+from types import SimpleNamespace
+from typing import Dict, Iterator, Optional, Sequence, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -270,6 +272,38 @@ def test_collect_nodes_for_selector_uses_cache(mock_run):
         kubernetes_monitoring._NODE_SELECTOR_CACHE_TTL = original_ttl
     assert second == {"worker-a"}
     assert mock_run.call_count == 2
+
+
+def test_run_kubectl_json_cache_reuses_payload(monkeypatch):
+    """kubectl JSON 호출이 타임아웃될 경우 직전 성공 결과를 재사용한다."""
+    kubernetes_monitoring._KUBECTL_JSON_CACHE.clear()
+    monkeypatch.setattr(kubernetes_monitoring, "_KUBECTL_CACHE_TTL", 0.1, raising=False)
+
+    times: Iterator[float] = iter([100.0, 100.5, 101.0])
+
+    def fake_monotonic() -> float:
+        return float(next(times))
+
+    monkeypatch.setattr(kubernetes_monitoring.time, "monotonic", fake_monotonic, raising=False)
+
+    call_counter = {"count": 0}
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        call_counter["count"] += 1
+        if call_counter["count"] == 1:
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(kubernetes_monitoring.subprocess, "run", fake_run, raising=False)
+
+    payload1, error1, _ = kubernetes_monitoring._run_kubectl_json(["get", "pods"])
+    assert error1 is None
+    assert payload1 is not None
+
+    payload2, error2, _ = kubernetes_monitoring._run_kubectl_json(["get", "pods"])
+    assert payload2 is payload1
+    assert error2 is None
+    assert call_counter["count"] == 2
 
 
 @patch("kubernetes_monitoring.subprocess.run")
