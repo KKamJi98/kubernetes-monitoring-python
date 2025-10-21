@@ -194,6 +194,39 @@ def test_collect_node_label_key_infos():
     assert "group-1" in nodegroup_info.sample_values
 
 
+@patch("kubernetes_monitoring._run_kubectl_json")
+def test_collect_nodes_for_selector_uses_cache(mock_run):
+    """라벨 셀렉터 캐시가 타임아웃 시 이전 결과를 재사용한다."""
+    kubernetes_monitoring._NODE_SELECTOR_CACHE.clear()
+    monkey_selector = kubernetes_monitoring.NodeLabelSelector(
+        key=kubernetes_monitoring.NODE_GROUP_LABEL,
+        value="group-a",
+    )
+    payload = MagicMock()
+    node = MagicMock()
+    node.metadata = MagicMock()
+    node.metadata.name = "worker-a"
+    payload.items = [node]
+    mock_run.side_effect = [
+        (payload, None, "kubectl get nodes"),
+        (None, "timeout", "kubectl get nodes"),
+    ]
+
+    # 첫 호출은 성공 응답을 캐시
+    first = kubernetes_monitoring._collect_nodes_for_selector(monkey_selector)
+    assert first == {"worker-a"}
+
+    # TTL을 즉시 만료시키기 위해 0으로 설정
+    original_ttl = kubernetes_monitoring._NODE_SELECTOR_CACHE_TTL
+    kubernetes_monitoring._NODE_SELECTOR_CACHE_TTL = 0.0
+    try:
+        second = kubernetes_monitoring._collect_nodes_for_selector(monkey_selector)
+    finally:
+        kubernetes_monitoring._NODE_SELECTOR_CACHE_TTL = original_ttl
+    assert second == {"worker-a"}
+    assert mock_run.call_count == 2
+
+
 @patch("kubernetes_monitoring.subprocess.run")
 def test_get_kubectl_top_pod_all_namespaces_success(mock_run):
     """kubectl top pod 전체 namespace 파싱 검증"""

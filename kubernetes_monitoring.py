@@ -16,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    FrozenSet,
     Iterator,
     List,
     Optional,
@@ -62,9 +63,15 @@ LIVE_REFRESH_INTERVAL = 2.0  # seconds
 INPUT_POLL_INTERVAL = 0.05  # seconds
 COMMAND_INPUT_VISIBLE = False
 
+_NODE_SELECTOR_CACHE: Dict["NodeLabelSelector", Tuple[float, FrozenSet[str]]] = {}
+_NODE_SELECTOR_CACHE_TTL = float(os.getenv("KMP_NODE_CACHE_TTL", "10.0"))
+
 FrameKey = Tuple[str, Tuple[str, ...]]
 
-API_REQUEST_TIMEOUT = 10.0
+try:
+    API_REQUEST_TIMEOUT = float(os.getenv("KMP_API_TIMEOUT", "10.0"))
+except ValueError:
+    API_REQUEST_TIMEOUT = 10.0
 
 if TYPE_CHECKING:
 
@@ -1147,8 +1154,15 @@ def _map_pod_to_node(namespace: Optional[str] = None) -> Dict[Tuple[str, str], s
 
 def _collect_nodes_for_selector(selector: NodeLabelSelector) -> Set[str]:
     """선택한 라벨 key=value에 속한 노드 이름 집합을 반환."""
+    now = time.monotonic()
+    cached = _NODE_SELECTOR_CACHE.get(selector)
+    if cached and now - cached[0] <= _NODE_SELECTOR_CACHE_TTL:
+        return set(cached[1])
+
     payload, error, _ = _run_kubectl_json(["get", "nodes", "-l", selector.expression])
     if error or payload is None:
+        if cached:
+            return set(cached[1])
         return set()
     result: Set[str] = set()
     for node in getattr(payload, "items", []) or []:
@@ -1156,6 +1170,7 @@ def _collect_nodes_for_selector(selector: NodeLabelSelector) -> Set[str]:
         name = getattr(metadata, "name", None)
         if name:
             result.add(str(name))
+    _NODE_SELECTOR_CACHE[selector] = (now, frozenset(result))
     return result
 
 
