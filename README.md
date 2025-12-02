@@ -39,6 +39,15 @@ Kubernetes 클러스터에서 이벤트, Pod, Node 상태 등을 빠르게 확�
 
 ## Installation & Usage
 
+### 0. uv 설치 (미설치 시)
+
+uv가 없다면 공식 설치 스크립트로 설치합니다. 설치 후 새 셸을 열거나 `exec $SHELL -l`로 PATH를 반영한 뒤 버전을 확인합니다.
+
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv --version
+```
+
 ### 1. Git Clone & Python 실행
 
 1. **Repository Clone**
