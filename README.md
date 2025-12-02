@@ -29,7 +29,7 @@ Kubernetes 클러스터에서 이벤트, Pod, Node 상태 등을 빠르게 확�
 
 ## Requirements
 
-- **Python 3.9 이상**
+- **Python 3.10 이상**
   - 가상환경(pyenv, conda 또는 venv)을 사용하면 충돌을 줄이고 독립된 환경을 유지할 수 있음
 - **필수 라이브러리**
   - [kubernetes](https://pypi.org/project/kubernetes/)
@@ -63,7 +63,7 @@ uv --version
    uv pip install .
    ```
 
-   - Python 3.9 버전 이상의 환경에서 실행을 권장합니다.
+   - Python 3.10 버전 이상의 환경에서 실행을 권장합니다.
 
 3. **스크립트 실행**
 
