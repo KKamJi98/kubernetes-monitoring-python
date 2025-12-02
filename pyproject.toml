@@ -1,6 +1,6 @@
 [project]
 name = "monitoring-kubernetes"
-version = "1.5.0"
+version = "2.0.0"
 description = "monitoring kubernetes with python"
 authors = [
     { name = "KKamJi", email = "xowl5460@naver.com" }
