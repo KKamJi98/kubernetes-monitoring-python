@@ -73,6 +73,58 @@ uv --version
 
    - 메뉴가 표시되면 원하는 항목 번호(또는 Q)를 입력하여 사용할 수 있습니다.
 
+### 1-b. uv 없이 실행 (pip/venv)
+
+uv를 사용할 수 없는 환경에서는 표준 venv+pip로 설치 후 실행합니다.
+
+1. **(옵션) 가상환경 생성 및 활성화**
+
+   ```shell
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. **pip 업그레이드 및 라이브러리 설치**
+
+   ```shell
+   python -m pip install --upgrade pip
+   python -m pip install .
+   ```
+
+   - 이미 활성화된 다른 가상환경이 있다면 위 가상환경 생성 단계는 건너뛸 수 있습니다.
+
+3. **스크립트 실행**
+
+   ```shell
+   python kubernetes_monitoring.py
+   ```
+
+   - uv를 사용하지 않을 때도 동일하게 메뉴를 통해 원하는 기능을 선택하면 됩니다.
+
+### 1-c. uv tool install로 전역 사용 (pipx 대체)
+
+uv의 tool 기능을 사용하면 가상환경 없이도 전역 실행 가능한 커맨드(`kmp`, `kubernetes-monitoring`)를 설치할 수 있습니다.
+
+1. **전역 설치**
+
+   ```shell
+   uv tool install .
+   ```
+
+   - 소스 코드를 수정하면서 바로 반영하려면 `uv tool install --editable .`를 사용할 수 있습니다.
+
+2. **실행**
+
+   ```shell
+   kmp
+   # 또는
+   kubernetes-monitoring
+   ```
+
+   - 설치 시 uv가 출력하는 tool bin 경로가 `PATH`에 포함되어 있어야 합니다. 누락 시 uv 출력 안내에 따라 PATH를 추가합니다.
+   - 코드가 업데이트된 뒤 전역 설치본을 갱신하려면 `uv tool upgrade kubernetes-monitoring`을 실행합니다. 로컬 소스를 기준으로 바로 덮어쓰려면 `uv tool install --reinstall .`를 사용할 수 있습니다.
+   - `--editable`로 설치한 경우 소스 변경이 즉시 반영되므로 별도 갱신 명령이 필요 없습니다.
+
 ### 2. 실행 파일로 등록하여 사용 (옵션)
 
 1. **Repository Clone**

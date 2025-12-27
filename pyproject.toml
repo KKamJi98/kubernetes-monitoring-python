@@ -14,6 +14,10 @@ dependencies = [
     "watchdog>=2.3.1",
 ]
 
+[project.scripts]
+kmp = "kubernetes_monitoring:main"
+kubernetes-monitoring = "kubernetes_monitoring:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
