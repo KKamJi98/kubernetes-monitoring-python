@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * Rename '재시작된 컨테이너 확인 및 로그 조회' menu to 'Container Monitoring (재시작된 컨테이너 및 로그)' for consistency.
 
+## [2.0.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.5.0...v2.0.0) (2025-12-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* require python 3.10
+
+### Features
+
+* **cli:** add console scripts and usage docs ([6872ae4](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/6872ae4e0bb43ec5f44da90dbb0918be795cf476))
+
+
+### Documentation
+
+* add uv installation instructions ([0c08a36](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/0c08a3656df0246de3e44d8feadbbc9637b558d9))
+
+
+### Miscellaneous Chores
+
+* require python 3.10 ([597bb2c](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/597bb2c67a8bd21494c22246c1f536fe9686072e))
+
 ## [1.5.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.4.0...v1.5.0) (2025-10-21)
 
 
