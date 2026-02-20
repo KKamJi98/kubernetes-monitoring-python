@@ -637,6 +637,78 @@ def _status_icon(status: str) -> Optional[str]:
     return mapping.get(status, None)
 
 
+def _style_by_status(value: str, context: str = "pod") -> str:
+    """Return a Rich style string based on status value and context."""
+    v = value.strip().lower() if value else ""
+    if context == "pod":
+        if v in ("running", "succeeded"):
+            return "green"
+        if v in ("pending", "containercreating"):
+            return "yellow"
+        if v in (
+            "failed",
+            "crashloopbackoff",
+            "imagepullbackoff",
+            "errimagepull",
+            "error",
+            "oomkilled",
+            "terminated",
+        ):
+            return "red"
+    elif context == "node":
+        if v == "ready":
+            return "green"
+        if v == "notready":
+            return "red"
+    elif context == "event":
+        if v == "warning":
+            return "yellow"
+        if v == "normal":
+            return "dim"
+    return ""
+
+
+def _row_style_for_status(phase: str, context: str = "pod") -> str:
+    """Return a row-level style based on resource status."""
+    return _style_by_status(phase, context)
+
+
+def _render_empty_state(
+    tracker: "LiveFrameTracker",
+    command: str,
+    title: str,
+    message: str,
+    suggestion: str = "",
+) -> None:
+    """Render an empty-state panel with optional suggestion text."""
+    body = message
+    if suggestion:
+        body = f"{message}\n[dim]{suggestion}[/dim]"
+    frame_key = _make_frame_key("empty")
+    snapshot = _format_plain_snapshot(
+        SnapshotPayload(
+            title=f"{title} - Empty",
+            status="empty",
+            body=message,
+            command=command,
+        )
+    )
+    tracker.update(
+        frame_key,
+        _compose_group(
+            command,
+            Panel(
+                Text.from_markup(body),
+                title="Info",
+                style="dim",
+                border_style="blue",
+            ),
+        ),
+        snapshot,
+        input_state=CURRENT_INPUT_DISPLAY,
+    )
+
+
 def _format_plain_snapshot(payload: SnapshotPayload) -> str:
     """텍스트 기반 스냅샷을 Slack Markdown으로 변환."""
     lines: List[str] = []
@@ -865,7 +937,7 @@ def _handle_csv_save(live: Live, tracker: "LiveFrameTracker", command: str) -> N
     """CSV 저장 요청을 처리."""
     if not tracker.latest_structured_data:
         live.console.print(
-            f"\n입력 '{command}' 처리 실패: CSV로 저장할 수 있는 테이블 데이터가 없습니다.",
+            f"\nCommand '{command}' failed: No table data available for CSV export.",
             style="bold yellow",
         )
         return
@@ -876,14 +948,14 @@ def _handle_csv_save(live: Live, tracker: "LiveFrameTracker", command: str) -> N
         path = _save_csv_snapshot(headers, rows)
     except (SnapshotSaveError, KeyError) as exc:
         live.console.print(
-            f"\n입력 '{command}' 처리 실패: {exc}",
+            f"\nCommand '{command}' failed: {exc}",
             style="bold red",
         )
         _clear_input_display()
         return
 
     live.console.print(
-        f"\n입력 '{command}' 처리 성공: CSV 스냅샷 저장 완료 → {path}",
+        f"\nCommand '{command}' success: CSV snapshot saved → {path}",
         style="bold green",
     )
     _clear_input_display()
@@ -906,7 +978,7 @@ def _handle_snapshot_command(
     if normalized in SNAPSHOT_SAVE_COMMANDS:
         if not tracker.latest_snapshot:
             live.console.print(
-                f"\n입력 '{display_command}' 처리 실패: 저장할 데이터가 없습니다.",
+                f"\nCommand '{display_command}' failed: No data to save.",
                 style="bold yellow",
             )
             return
@@ -934,19 +1006,17 @@ def _handle_snapshot_command(
                 if markdown_path and markdown_path.exists():
                     markdown_path.unlink()
             live.console.print(
-                f"\n입력 '{display_command}' 처리 실패: {exc}",
+                f"\nCommand '{display_command}' failed: {exc}",
                 style="bold red",
             )
             _clear_input_display()
             return
         live.console.print(
-            "\n입력 '{command}' 처리 성공: 스냅샷 저장 완료 → {markdown}{csv}".format(
+            "\nCommand '{command}' success: Snapshot saved → {markdown}{csv}".format(
                 command=display_command,
                 markdown=markdown_path,
                 csv=(
-                    f" (CSV: {csv_path})"
-                    if csv_path is not None
-                    else " (CSV 데이터 없음)"
+                    f" (CSV: {csv_path})" if csv_path is not None else " (no CSV data)"
                 ),
             ),
             style="bold green",
@@ -955,8 +1025,8 @@ def _handle_snapshot_command(
         return
 
     live.console.print(
-        f"\n입력 '{display_command}' 은(는) 지원하지 않는 명령입니다. "
-        "사용 가능한 입력: s, save, csv, ...",
+        f"\nCommand '{display_command}' is not supported. "
+        "Available commands: s, save, csv, ...",
         style="bold yellow",
     )
 
@@ -971,19 +1041,31 @@ def _tick_iteration(live: Live, tracker: "LiveFrameTracker") -> None:
 class LiveFrameTracker:
     """Live 갱신 및 스냅샷 생성을 추적하는 도우미."""
 
-    def __init__(self, live: Live) -> None:
+    def __init__(self, live: Live, view_name: str = "") -> None:
         self.live = live
+        self.view_name = view_name
+        self._loading = False
         self.layout = Layout(name="root")
         self.layout.split(
+            Layout(name="header", size=1),
             Layout(name="input", size=3),
             Layout(name="body", ratio=1),
             Layout(name="footer", size=3),
+            Layout(name="helpbar", size=1),
         )
+        # Header bar: breadcrumb + context + loading
+        self._update_header()
         self.layout["input"].visible = False
         self.layout["input"].update(Text(""))
         self.layout["body"].update(Text(""))
         self.layout["footer"].visible = False
         self.layout["footer"].update(Text(""))
+        # Help bar: persistent footer
+        help_text = Text.from_markup(
+            "[dim]:s[/dim] save  [dim]:csv[/dim] export CSV  "
+            "[dim]Ctrl+C[/dim] back to menu"
+        )
+        self.layout["helpbar"].update(help_text)
         self.section_frames: Dict[str, Optional[FrameKey]] = {
             "input": None,
             "body": None,
@@ -993,6 +1075,33 @@ class LiveFrameTracker:
         self.latest_structured_data: Optional[Dict[str, Any]] = None
         self.last_input_state: str = ""
         self.live.update(self.layout)
+
+    def _update_header(self) -> None:
+        """Render the header bar with view name, context, and loading state."""
+        ctx = _get_current_context()
+        parts = []
+        if self.view_name:
+            parts.append(f"[bold cyan]{self.view_name}[/bold cyan]")
+        parts.append(f"[dim]{ctx}[/dim]")
+        parts.append(f"[dim]Auto-refresh: {LIVE_REFRESH_INTERVAL:.0f}s[/dim]")
+        if self._loading:
+            parts.append("[bold yellow]loading...[/bold yellow]")
+        header_text = Text.from_markup("  |  ".join(parts))
+        self.layout["header"].update(header_text)
+
+    def show_loading(self) -> None:
+        """Show loading indicator in the header bar."""
+        if not self._loading:
+            self._loading = True
+            self._update_header()
+            self.live.refresh()
+
+    def clear_loading(self) -> None:
+        """Clear loading indicator from the header bar."""
+        if self._loading:
+            self._loading = False
+            self._update_header()
+            self.live.refresh()
 
     def _sync_input_panel(
         self,
@@ -1021,6 +1130,11 @@ class LiveFrameTracker:
         structured_data: Optional[Dict[str, Any]] = None,
         input_state: Optional[str] = None,
     ) -> None:
+        # Auto-clear loading on frame update
+        if self._loading:
+            self._loading = False
+            self._update_header()
+
         current_input_state = (
             input_state if input_state is not None else CURRENT_INPUT_DISPLAY
         )
@@ -1335,6 +1449,35 @@ def _node_label_value(node: AttrDict, label_key: str) -> Optional[str]:
     return _label_value_from_mapping(labels, label_key)
 
 
+_CURRENT_CONTEXT_CACHE: Optional[Tuple[float, str]] = None
+_CURRENT_CONTEXT_TTL = 30.0
+
+
+def _get_current_context() -> str:
+    """Return the current kubectl context name, cached for performance."""
+    global _CURRENT_CONTEXT_CACHE
+    now = time.monotonic()
+    if (
+        _CURRENT_CONTEXT_CACHE
+        and now - _CURRENT_CONTEXT_CACHE[0] <= _CURRENT_CONTEXT_TTL
+    ):
+        return _CURRENT_CONTEXT_CACHE[1]
+    try:
+        result = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5.0,
+        )
+        ctx = result.stdout.strip() if result.returncode == 0 else "unknown"
+    except (subprocess.TimeoutExpired, OSError):
+        ctx = "unknown"
+    _CURRENT_CONTEXT_CACHE = (now, ctx)
+    return ctx
+
+
 def cleanup() -> None:
     """리소스 정리 및 종료 전 후처리.
 
@@ -1342,13 +1485,12 @@ def cleanup() -> None:
     공통 정리 지점을 한곳으로 모읍니다.
     """
     # 필요한 경우, 추가 정리 작업을 이곳에 배치합니다.
-    console.print("정리 중...", style="dim")
+    console.print("Cleaning up...", style="dim")
 
 
 def _exit_with_cleanup(code: int, message: str, style: str = "bold yellow") -> None:
     """메시지를 출력하고 정리 후 지정된 코드로 종료."""
-    # 요구사항: 메시지 앞에 한 줄 공백 출력
-    print()
+    console.print()
     console.print(message, style=style)
     cleanup()
     sys.exit(code)
@@ -1365,7 +1507,7 @@ def setup_asyncio_graceful_shutdown() -> None:
         import asyncio
         import contextlib
         import signal
-    except Exception:
+    except ImportError:
         return
 
     loop = asyncio.get_event_loop()
@@ -1374,7 +1516,7 @@ def setup_asyncio_graceful_shutdown() -> None:
 
     def _handle_signal(sig: int) -> None:
         console.print(
-            f"신호 수신: {signal.Signals(sig).name}. 안전 종료를 시작합니다.",
+            f"Signal received: {signal.Signals(sig).name}. Initiating graceful shutdown.",
             style="bold yellow",
         )
         stop_event.set()
@@ -1411,17 +1553,17 @@ def choose_namespace() -> Optional[str]:
     payload, error, command = _run_kubectl_json(["get", "namespaces"])
     if error or payload is None:
         console.print(
-            "Namespace 정보를 가져오는 중 오류가 발생했습니다.",
+            "Failed to fetch namespace information.",
             style="bold red",
         )
-        detail = error or "kubectl이 빈 응답을 반환했습니다."
+        detail = error or "kubectl returned an empty response."
         console.print(detail, style="bold yellow")
-        console.print(f"명령어: {command}", style="dim")
+        console.print(f"Command: {command}", style="dim")
         return None
 
     items = getattr(payload, "items", []) or []
     if not items:
-        print("Namespace가 존재하지 않습니다.")
+        console.print("No namespaces found.", style="bold yellow")
         return None
 
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
@@ -1432,17 +1574,19 @@ def choose_namespace() -> Optional[str]:
     console.print("\n=== Available Namespaces ===", style="bold green")
     console.print(table)
 
-    selection = Prompt.ask(
-        "조회할 Namespace 번호를 선택하세요 (기본값: 전체)", default=""
-    )
+    selection = Prompt.ask("Select namespace number (default: all)", default="")
     if not selection:
         return None
     if not selection.isdigit():
-        print("숫자로 입력해주세요. 전체 조회로 진행합니다.")
+        console.print(
+            "Invalid input. Proceeding with all namespaces.", style="bold yellow"
+        )
         return None
     index = int(selection)
     if index < 1 or index > len(items):
-        print("유효하지 않은 번호입니다. 전체 조회로 진행합니다.")
+        console.print(
+            "Invalid number. Proceeding with all namespaces.", style="bold yellow"
+        )
         return None
     chosen_ns = str(items[index - 1].metadata.name)
     return chosen_ns
@@ -1460,19 +1604,19 @@ def choose_node_group() -> Optional[NodeLabelSelection]:
     payload, error, command = _run_kubectl_json(["get", "nodes"])
     if error or payload is None:
         console.print(
-            "Node 정보를 가져오는 중 오류가 발생했습니다.",
+            "Failed to fetch node information.",
             style="bold red",
         )
-        detail = error or "kubectl이 빈 응답을 반환했습니다."
+        detail = error or "kubectl returned an empty response."
         console.print(detail, style="bold yellow")
-        console.print(f"명령어: {command}", style="dim")
+        console.print(f"Command: {command}", style="dim")
         return None
 
     nodes = list(getattr(payload, "items", []) or [])
 
     key_infos = _collect_node_label_key_infos(nodes)
     if not key_infos:
-        print("노드 라벨이 존재하지 않습니다.")
+        console.print("No node labels found.", style="bold yellow")
         return None
 
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
@@ -1495,25 +1639,25 @@ def choose_node_group() -> Optional[NodeLabelSelection]:
     console.print(table)
 
     default_prompt = str(default_key_index) if default_key_index else "1"
-    selection = Prompt.ask(
-        "사용할 라벨 키 번호를 선택하세요", default=default_prompt
-    ).strip()
+    selection = Prompt.ask("Select label key number", default=default_prompt).strip()
     if selection and not selection.isdigit():
-        print("숫자로 입력해주세요. 선택을 취소합니다.")
+        console.print(
+            "Please enter a number. Selection cancelled.", style="bold yellow"
+        )
         return None
     if selection:
         key_index = int(selection)
     else:
         key_index = int(default_prompt)
     if key_index < 1 or key_index > len(key_infos):
-        print("유효하지 않은 번호입니다. 선택을 취소합니다.")
+        console.print("Invalid number. Selection cancelled.", style="bold yellow")
         return None
     chosen_key = key_infos[key_index - 1].key
 
     value_infos = _extract_node_label_infos(nodes, chosen_key)
     if not value_infos:
         console.print(
-            f"{chosen_key} 라벨 키에 해당하는 값이 없습니다. 라벨만 표시합니다.",
+            f"No values found for label key '{chosen_key}'. Displaying label only.",
             style="bold yellow",
         )
         return NodeLabelSelection(key=chosen_key)
@@ -1539,30 +1683,32 @@ def choose_node_group() -> Optional[NodeLabelSelection]:
     console.print(value_table)
 
     value_selection = Prompt.ask(
-        "필터링할 라벨 값 번호를 선택하세요 (기본값: 선택 취소)", default=""
+        "Select label value to filter (default: no filter)", default=""
     ).strip()
     if not value_selection:
         console.print(
-            f"{chosen_key} 라벨을 필터 없이 표시합니다.",
+            f"Displaying label '{chosen_key}' without filter.",
             style="bold green",
         )
         return NodeLabelSelection(key=chosen_key)
     if not value_selection.isdigit():
-        print("숫자로 입력해주세요. 필터링하지 않음으로 진행합니다.")
+        console.print(
+            "Please enter a number. Proceeding without filter.", style="bold yellow"
+        )
         return None
     value_index = int(value_selection)
     if value_index < 1 or value_index > len(value_infos):
-        print("유효하지 않은 번호입니다. 필터링하지 않음으로 진행합니다.")
+        console.print("Invalid number. Proceeding without filter.", style="bold yellow")
         return None
     chosen_info = value_infos[value_index - 1]
     console.print(
-        f"선택한 라벨: {chosen_info.label} (노드 {chosen_info.node_count}개)",
+        f"Selected label: {chosen_info.label} ({chosen_info.node_count} nodes)",
         style="bold green",
     )
     return NodeLabelSelection(key=chosen_info.key, value=chosen_info.value)
 
 
-def get_tail_lines(prompt="몇 줄씩 확인할까요? (숫자 입력. default: 20줄): ") -> str:
+def get_tail_lines(prompt="How many lines? (default: 20): ") -> str:
     """
     tail -n에 사용할 숫자 입력 (기본값 20)
     """
@@ -1570,7 +1716,7 @@ def get_tail_lines(prompt="몇 줄씩 확인할까요? (숫자 입력. default: 
     if val.isdigit():
         return val
     else:
-        console.print("숫자로 입력해주세요.", style="bold red")
+        console.print("Please enter a number.", style="bold red")
         return "20"
 
 
@@ -1588,7 +1734,7 @@ def get_pods(
     args.extend(["--chunk-size=0"])
     payload, error, command = _run_kubectl_json(args)
     if error or payload is None:
-        return [], error or "kubectl이 빈 응답을 반환했습니다.", command
+        return [], error or "kubectl returned an empty response.", command
     items = getattr(payload, "items", []) or []
     return list(items), None, command
 
@@ -1600,7 +1746,7 @@ def get_nodes(
     args: List[str] = ["get", "nodes", "--chunk-size=0"]
     payload, error, command = _run_kubectl_json(args)
     if error or payload is None:
-        return [], error or "kubectl이 빈 응답을 반환했습니다.", command
+        return [], error or "kubectl returned an empty response.", command
     items = list(getattr(payload, "items", []) or [])
     if label_selector:
         key, _, value = label_selector.partition("=")
@@ -1627,18 +1773,18 @@ def _handle_kubectl_fetch_error(
     snapshot_title: str,
 ) -> None:
     """kubectl 호출 오류를 공통 형식으로 렌더링."""
-    normalized = detail or "kubectl이 빈 응답을 반환했습니다."
+    normalized = detail or "kubectl returned an empty response."
     is_timeout = "timeout" in normalized.lower()
     status = "warning" if is_timeout else "error"
     panel_style = "bold yellow" if is_timeout else "bold red"
-    panel_title = "경고" if is_timeout else "오류"
+    panel_title = "Warning" if is_timeout else "Error"
     if is_timeout:
         message = (
-            f"{context} 중 지연이 발생했습니다. 네트워크 연결과 인증 상태를 확인하세요."
+            f"Delay occurred while {context}. Check network connection and auth status."
         )
     else:
-        message = f"{context} 중 오류가 발생했습니다."
-    body_text = f"{message}\n세부 정보: {normalized}"
+        message = f"Error occurred while {context}."
+    body_text = f"{message}\nDetails: {normalized}"
     frame_key = _make_frame_key("kubectl_error", context, normalized)
     snapshot = _format_plain_snapshot(
         SnapshotPayload(
@@ -1667,10 +1813,10 @@ def watch_event_monitoring() -> None:
     console.print("\n[1] Event Monitoring", style="bold blue")
     ns = choose_namespace()
     event_choice = Prompt.ask(
-        "어떤 이벤트를 보시겠습니까? (1: 전체 이벤트(default), 2: 비정상 이벤트(!=Normal))",
+        "Which events to view? (1: All events (default), 2: Abnormal events (!=Normal))",
         default="1",
     )
-    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("How many lines to display? (e.g. 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
     field_selector = "type!=Normal" if event_choice == "2" else None
@@ -1681,20 +1827,21 @@ def watch_event_monitoring() -> None:
         kubectl_args.append("-A")
     if field_selector:
         kubectl_args.extend(["--field-selector", field_selector])
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Event Monitoring")
                 while True:
+                    tracker.show_loading()
                     payload, error, command_descriptor = _run_kubectl_json(kubectl_args)
                     if error or payload is None:
-                        detail = error or "kubectl이 빈 응답을 반환했습니다."
+                        detail = error or "kubectl returned an empty response."
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="이벤트 정보를 가져오는",
+                            context="fetching event data",
                             detail=detail,
                             snapshot_title="Event Monitoring - Error",
                         )
@@ -1703,27 +1850,12 @@ def watch_event_monitoring() -> None:
 
                     items = list(getattr(payload, "items", []) or [])
                     if not items:
-                        frame_key = _make_frame_key("empty")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Event Monitoring - Empty",
-                                status="empty",
-                                body="표시할 이벤트가 없습니다.",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(
-                                    "표시할 이벤트가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            command_descriptor,
+                            "Event Monitoring",
+                            "No events to display.",
+                            suggestion="Try broadening the namespace filter or selecting all events.",
                         )
                         tracker.tick()
                         continue
@@ -1769,6 +1901,7 @@ def watch_event_monitoring() -> None:
                             reason,
                             object_ref,
                             message,
+                            style=_row_style_for_status(event_type, "event"),
                         )
                         markdown_rows.append(
                             [
@@ -1822,7 +1955,7 @@ def watch_event_monitoring() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def view_restarted_container_logs() -> None:
@@ -1830,16 +1963,16 @@ def view_restarted_container_logs() -> None:
     2) Container Monitoring (재시작된 컨테이너 및 로그)
        최근 재시작된 컨테이너 목록에서 선택하여 이전 컨테이너의 로그 확인
     """
-    console.print("\n[2] 재시작된 컨테이너 확인 및 로그 조회", style="bold blue")
+    console.print("\n[2] Container Restart Logs", style="bold blue")
     ns = choose_namespace()
     pods, error, command = get_pods(ns)
     if error:
         console.print(
-            "Pod 정보를 가져오는 중 오류가 발생했습니다.",
+            "Failed to fetch pod information.",
             style="bold red",
         )
         console.print(f"{error}", style="bold yellow")
-        console.print(f"명령어: {command}", style="dim")
+        console.print(f"Command: {command}", style="dim")
         return
     if not pods:
         return
@@ -1862,11 +1995,11 @@ def view_restarted_container_logs() -> None:
                     (ns_pod, p_name, c_status.name, finished_at)
                 )
     restarted_containers.sort(key=lambda x: x[3], reverse=True)
-    line_count = int(get_tail_lines("몇 개의 컨테이너를 표시할까요? (예: 20): "))
+    line_count = int(get_tail_lines("How many containers to display? (e.g. 20): "))
     displayed_containers = restarted_containers[:line_count]
 
     if not displayed_containers:
-        print("최근 재시작된 컨테이너가 없습니다.")
+        console.print("No recently restarted containers found.", style="bold yellow")
         return
 
     table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
@@ -1878,30 +2011,36 @@ def view_restarted_container_logs() -> None:
     for i, (ns_pod, p_name, c_name, fat) in enumerate(displayed_containers, start=1):
         table.add_row(str(i), ns_pod, p_name, c_name, _format_timestamp(fat))
     console.print(
-        f"\n=== 최근 재시작된 컨테이너 목록 (시간 기준, Top {line_count}) ===\n",
+        f"\n=== Recently Restarted Containers (Top {line_count} by time) ===\n",
         style="bold green",
     )
     console.print(table)
 
-    sel = Prompt.ask("\n로그를 볼 INDEX를 입력 (Q: 종료)", default="").strip()
+    sel = Prompt.ask("\nEnter INDEX to view logs (Q: quit)", default="").strip()
     if sel.upper() == "Q" or not sel.isdigit():
         return
     idx = int(sel)
     if idx < 1 or idx > len(displayed_containers):
-        console.print("인덱스 범위를 벗어났습니다.", style="bold red")
+        console.print("Index out of range.", style="bold red")
         return
     ns_pod, p_name, c_name, _ = displayed_containers[idx - 1]
-    log_tail = Prompt.ask(
-        "몇 줄의 로그를 확인할까요? (미입력 시 50줄)", default="50"
-    ).strip()
+    log_tail = Prompt.ask("How many log lines? (default: 50)", default="50").strip()
     if not log_tail.isdigit():
-        console.print(
-            "입력하신 값이 숫자가 아닙니다. 50줄을 출력합니다.", style="bold red"
-        )
+        console.print("Invalid number. Displaying 50 lines.", style="bold red")
         log_tail = "50"
-    cmd = f"kubectl logs -n {ns_pod} -p {p_name} -c {c_name} --tail={log_tail}"
-    print(f"\n실행 명령어: {cmd}\n")
-    os.system(cmd)
+    cmd_args = [
+        "kubectl",
+        "logs",
+        "-n",
+        ns_pod,
+        "-p",
+        p_name,
+        "-c",
+        c_name,
+        f"--tail={log_tail}",
+    ]
+    console.print(f"\nCommand: {shlex.join(cmd_args)}\n", style="dim")
+    subprocess.run(cmd_args, check=False)
 
 
 def watch_pod_monitoring_by_creation() -> None:
@@ -1909,58 +2048,42 @@ def watch_pod_monitoring_by_creation() -> None:
     3) Pod Monitoring (생성된 순서)
        Pod IP 및 Node Name을 선택적으로 표시하며, namespace 지정 가능
     """
-    console.print("\n[3] Pod Monitoring (생성된 순서)", style="bold blue")
+    console.print("\n[3] Pod List (by creation)", style="bold blue")
     ns = choose_namespace()
     extra = (
-        Prompt.ask("Pod IP 및 Node Name을 표시할까요? (yes/no)", default="no")
-        .strip()
-        .lower()
+        Prompt.ask("Show Pod IP and Node Name? (yes/no)", default="no").strip().lower()
     )
     show_extra = extra.startswith("y")
-    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("How many lines to display? (e.g. 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Pod List (by creation)")
                 while True:
+                    tracker.show_loading()
                     pods, error, command_descriptor = get_pods(ns)
                     if error:
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="Pod 정보를 가져오는",
+                            context="fetching pod data",
                             detail=error,
-                            snapshot_title="Pod Monitoring (생성 순) - Error",
+                            snapshot_title="Pod List (by creation) - Error",
                         )
                         tracker.tick()
                         continue
 
                     if not pods:
-                        frame_key = _make_frame_key("empty")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Monitoring (생성 순) - Empty",
-                                status="empty",
-                                body="표시할 결과가 없습니다.",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(
-                                    "표시할 결과가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            command_descriptor,
+                            "Pod List (by creation)",
+                            "No results to display.",
+                            suggestion="Try selecting a different namespace.",
                         )
                         tracker.tick()
                         continue
@@ -2022,7 +2145,7 @@ def watch_pod_monitoring_by_creation() -> None:
                         )
                         if show_extra:
                             row.extend([pod_ip, node_name])
-                        table.add_row(*row)
+                        table.add_row(*row, style=_row_style_for_status(phase, "pod"))
 
                         markdown_row = row.copy()
                         markdown_rows.append(markdown_row)
@@ -2064,7 +2187,7 @@ def watch_pod_monitoring_by_creation() -> None:
                         headers.extend(["PodIP", "Node"])
                     headers = _label_time_headers(headers)
                     snapshot = _format_table_snapshot(
-                        title="Pod Monitoring (생성 순)",
+                        title="Pod List (by creation)",
                         headers=headers,
                         rows=markdown_rows,
                         command=command_descriptor,
@@ -2080,7 +2203,7 @@ def watch_pod_monitoring_by_creation() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_non_running_pod() -> None:
@@ -2088,30 +2211,29 @@ def watch_non_running_pod() -> None:
     4) Pod Monitoring (Running이 아닌 Pod)
        Pod IP 및 Node Name을 선택적으로 표시하며, namespace 지정 가능
     """
-    console.print("\n[4] Pod Monitoring (Running이 아닌 Pod)", style="bold blue")
+    console.print("\n[4] Non-Running Pods", style="bold blue")
     ns = choose_namespace()
     extra = (
-        Prompt.ask("Pod IP 및 Node Name을 표시할까요? (yes/no)", default="no")
-        .strip()
-        .lower()
+        Prompt.ask("Show Pod IP and Node Name? (yes/no)", default="no").strip().lower()
     )
     show_extra = extra.startswith("y")
-    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("How many lines to display? (e.g. 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Non-Running Pods")
                 while True:
+                    tracker.show_loading()
                     pods, error, command_descriptor = get_pods(ns)
                     if error:
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="Pod 정보를 가져오는",
+                            context="fetching pod data",
                             detail=error,
                             snapshot_title="Non-Running Pod - Error",
                         )
@@ -2124,27 +2246,12 @@ def watch_non_running_pod() -> None:
 
                     filtered = [pod for pod in pods if _is_non_running(pod)]
                     if not filtered:
-                        frame_key = _make_frame_key("empty")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Non-Running Pod - Empty",
-                                status="empty",
-                                body="조건에 해당하는 Pod가 없습니다.",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(
-                                    "조건에 해당하는 Pod가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            command_descriptor,
+                            "Non-Running Pods",
+                            "No matching pods found.",
+                            suggestion="All pods are Running or Succeeded.",
                         )
                         tracker.tick()
                         continue
@@ -2210,7 +2317,7 @@ def watch_non_running_pod() -> None:
                         )
                         if show_extra:
                             row.extend([pod_ip, node_name])
-                        table.add_row(*row)
+                        table.add_row(*row, style=_row_style_for_status(phase, "pod"))
 
                         markdown_rows.append(row.copy())
                         frame_parts.append(
@@ -2252,7 +2359,7 @@ def watch_non_running_pod() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_pod_counts() -> None:
@@ -2260,22 +2367,21 @@ def watch_pod_counts() -> None:
     5) Pod Monitoring - 전체/정상/비정상 Pod 개수 출력 (2초 간격)
        namespace 지정 가능
     """
-    console.print(
-        "\n[5] Pod Monitoring (전체/정상/비정상 Pod 개수 출력)", style="bold blue"
-    )
+    console.print("\n[5] Pod Count Summary", style="bold blue")
     ns = choose_namespace()
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Pod Count Summary")
                 while True:
+                    tracker.show_loading()
                     pods, error, command_descriptor = get_pods(ns)
                     if error:
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="Pod 정보를 가져오는",
+                            context="fetching pod data",
                             detail=error,
                             snapshot_title="Pod Count Summary - Error",
                         )
@@ -2329,7 +2435,7 @@ def watch_pod_counts() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_node_monitoring_by_creation() -> None:
@@ -2337,36 +2443,35 @@ def watch_node_monitoring_by_creation() -> None:
     7) Node Monitoring (생성된 순서)
        AZ와 선택한 라벨(key=value) 정보를 함께 표시하며, 사용자 지정 라벨로 필터링 가능
     """
-    console.print("\n[7] Node Monitoring (생성된 순서)", style="bold blue")
+    console.print("\n[7] Node List (by creation)", style="bold blue")
     filter_choice = (
-        Prompt.ask(
-            "특정 노드 라벨(key=value)로 필터링 하시겠습니까? (yes/no)", default="no"
-        )
+        Prompt.ask("Filter by node label (key=value)? (yes/no)", default="no")
         .strip()
         .lower()
     )
     label_selection = choose_node_group() if filter_choice.startswith("y") else None
-    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("How many lines to display? (e.g. 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
     label_selector = label_selection.expression if label_selection else None
     label_column_key = label_selection.key if label_selection else NODE_GROUP_LABEL
     label_column_title = _label_column_title(label_column_key)
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Node List (by creation)")
                 while True:
+                    tracker.show_loading()
                     nodes, error, command_descriptor = get_nodes(label_selector)
                     if error:
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="Node 정보를 가져오는",
+                            context="fetching node data",
                             detail=error,
-                            snapshot_title="Node Monitoring (생성 순) - Error",
+                            snapshot_title="Node List (by creation) - Error",
                         )
                         tracker.tick()
                         continue
@@ -2380,27 +2485,12 @@ def watch_node_monitoring_by_creation() -> None:
                         ]
 
                     if not nodes:
-                        frame_key = _make_frame_key("empty")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Node Monitoring (생성 순) - Empty",
-                                status="empty",
-                                body="표시할 노드가 없습니다.",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(
-                                    "표시할 노드가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            command_descriptor,
+                            "Node List (by creation)",
+                            "No nodes to display.",
+                            suggestion="Check label filter or cluster connectivity.",
                         )
                         tracker.tick()
                         continue
@@ -2452,7 +2542,9 @@ def watch_node_monitoring_by_creation() -> None:
                             version,
                             created_at,
                         ]
-                        table.add_row(*row)
+                        table.add_row(
+                            *row, style=_row_style_for_status(ready_state, "node")
+                        )
                         markdown_rows.append(row.copy())
                         frame_parts.append("|".join(row))
 
@@ -2468,7 +2560,7 @@ def watch_node_monitoring_by_creation() -> None:
                         ]
                     )
                     snapshot = _format_table_snapshot(
-                        title="Node Monitoring (생성 순)",
+                        title="Node List (by creation)",
                         headers=headers,
                         rows=markdown_rows,
                         command=command_descriptor,
@@ -2484,7 +2576,7 @@ def watch_node_monitoring_by_creation() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_unhealthy_nodes() -> None:
@@ -2492,34 +2584,33 @@ def watch_unhealthy_nodes() -> None:
     8) Node Monitoring (Unhealthy Node 확인)
        AZ와 선택한 라벨(key=value) 정보를 함께 표시하며, 지정 라벨로 필터링 가능
     """
-    console.print("\n[8] Node Monitoring (Unhealthy Node 확인)", style="bold blue")
+    console.print("\n[8] Unhealthy Nodes", style="bold blue")
     filter_choice = (
-        Prompt.ask(
-            "특정 노드 라벨(key=value)로 필터링 하시겠습니까? (yes/no)", default="no"
-        )
+        Prompt.ask("Filter by node label (key=value)? (yes/no)", default="no")
         .strip()
         .lower()
     )
     label_selection = choose_node_group() if filter_choice.startswith("y") else None
-    tail_num_raw = get_tail_lines("몇 줄씩 확인할까요? (예: 20): ")
+    tail_num_raw = get_tail_lines("How many lines to display? (e.g. 20): ")
     tail_limit = _parse_tail_count(tail_num_raw)
 
     label_selector = label_selection.expression if label_selection else None
     label_column_key = label_selection.key if label_selection else NODE_GROUP_LABEL
     label_column_title = _label_column_title(label_column_key)
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Unhealthy Nodes")
                 while True:
+                    tracker.show_loading()
                     nodes, error, command_descriptor = get_nodes(label_selector)
                     if error:
                         _handle_kubectl_fetch_error(
                             tracker,
                             command=command_descriptor,
-                            context="Node 정보를 가져오는",
+                            context="fetching node data",
                             detail=error,
                             snapshot_title="Unhealthy Node - Error",
                         )
@@ -2538,27 +2629,12 @@ def watch_unhealthy_nodes() -> None:
                         node for node in nodes if _node_ready_condition(node) != "Ready"
                     ]
                     if not unhealthy:
-                        frame_key = _make_frame_key("empty")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Unhealthy Node - Empty",
-                                status="empty",
-                                body="Unhealthy 노드가 없습니다.",
-                                command=command_descriptor,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                command_descriptor,
-                                Panel(
-                                    "Unhealthy 노드가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            command_descriptor,
+                            "Unhealthy Nodes",
+                            "No unhealthy nodes found.",
+                            suggestion="All nodes are in Ready state.",
                         )
                         tracker.tick()
                         continue
@@ -2614,7 +2690,9 @@ def watch_unhealthy_nodes() -> None:
                             version,
                             created_at,
                         ]
-                        table.add_row(*row)
+                        table.add_row(
+                            *row, style=_row_style_for_status(ready_state, "node")
+                        )
                         markdown_rows.append(row.copy())
                         frame_parts.append("|".join(row))
 
@@ -2647,7 +2725,7 @@ def watch_unhealthy_nodes() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_node_resources() -> None:
@@ -2655,13 +2733,9 @@ def watch_node_resources() -> None:
     9) Node Monitoring (CPU/Memory 사용량 높은 순 정렬)
        사용자 선택 라벨(key=value) 기준으로 필터링 가능 (기본: NODE_GROUP_LABEL)
     """
-    console.print(
-        "\n[9] Node Monitoring (CPU/Memory 사용량 높은 순 정렬)", style="bold blue"
-    )
+    console.print("\n[9] Node Resource Usage (CPU/Memory)", style="bold blue")
     while True:
-        sort_key = Prompt.ask(
-            "정렬 기준을 선택하세요 (1: CPU, 2: Memory)", choices=["1", "2"]
-        )
+        sort_key = Prompt.ask("Select sort key (1: CPU, 2: Memory)", choices=["1", "2"])
         if sort_key == "1":
             sort_column = 3  # CPU 열 인덱스
             break
@@ -2669,17 +2743,15 @@ def watch_node_resources() -> None:
             sort_column = 5  # Memory 열 인덱스
             break
         else:
-            console.print("잘못된 입력입니다. 다시 입력해주세요.", style="bold red")
+            console.print("Invalid input. Please try again.", style="bold red")
 
-    top_n = Prompt.ask("상위 몇 개 노드를 볼까요?", default="20")
+    top_n = Prompt.ask("How many top nodes to display?", default="20")
     if not top_n.isdigit():
-        console.print("숫자가 아닙니다. 기본값 20을 적용합니다.", style="bold red")
+        console.print("Not a number. Using default: 20.", style="bold red")
         top_n = "20"
 
     filter_choice = (
-        Prompt.ask(
-            "특정 노드 라벨(key=value)로 필터링 하시겠습니까? (yes/no)", default="no"
-        )
+        Prompt.ask("Filter by node label (key=value)? (yes/no)", default="no")
         .strip()
         .lower()
     )
@@ -2692,13 +2764,14 @@ def watch_node_resources() -> None:
         base_cmd = "kubectl top node --no-headers"
 
     full_cmd = f"{base_cmd} | sort -k{sort_column} -nr 2>/dev/null | head -n {top_n}"
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Node Resource Usage")
                 while True:
+                    tracker.show_loading()
                     stdout, error = _run_shell_command(full_cmd)
                     if error:
                         frame_key = ("error", (error,))
@@ -2706,7 +2779,7 @@ def watch_node_resources() -> None:
                             SnapshotPayload(
                                 title="Node Resource Top - Error",
                                 status="error",
-                                body=f"명령 실행에 실패했습니다:\n{error}",
+                                body=f"Command execution failed:\n{error}",
                                 command=full_cmd,
                             )
                         )
@@ -2715,8 +2788,8 @@ def watch_node_resources() -> None:
                             _compose_group(
                                 full_cmd,
                                 Panel(
-                                    f"명령 실행에 실패했습니다:\n{error}",
-                                    title="오류",
+                                    f"Command execution failed:\n{error}",
+                                    title="Error",
                                     style="bold red",
                                 ),
                             ),
@@ -2728,27 +2801,11 @@ def watch_node_resources() -> None:
                     else:
                         output = stdout.rstrip()
                         if not output:
-                            frame_key = ("empty", ("",))
-                            snapshot = _format_plain_snapshot(
-                                SnapshotPayload(
-                                    title="Node Resource Top - Empty",
-                                    status="empty",
-                                    body="표시할 노드가 없습니다.",
-                                    command=full_cmd,
-                                )
-                            )
-                            tracker.update(
-                                frame_key,
-                                _compose_group(
-                                    full_cmd,
-                                    Panel(
-                                        "표시할 노드가 없습니다.",
-                                        title="정보",
-                                        style="bold yellow",
-                                    ),
-                                ),
-                                snapshot,
-                                input_state=CURRENT_INPUT_DISPLAY,
+                            _render_empty_state(
+                                tracker,
+                                full_cmd,
+                                "Node Resource Usage",
+                                "No nodes to display.",
                             )
                             tracker.tick()
                             continue
@@ -2777,7 +2834,7 @@ def watch_node_resources() -> None:
                             )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def watch_pod_resources() -> None:
@@ -2785,30 +2842,22 @@ def watch_pod_resources() -> None:
     6) Pod Monitoring (CPU/Memory 사용량 높은 순 정렬)
        namespace 선택 및 노드 라벨(key=value) 기반 필터링 지원
     """
-    console.print(
-        "\n[6] Pod Monitoring (CPU/Memory 사용량 높은 순 정렬)", style="bold blue"
-    )
+    console.print("\n[6] Pod Resource Usage (CPU/Memory)", style="bold blue")
     namespace = choose_namespace()
 
-    sort_key = Prompt.ask(
-        "정렬 기준을 선택하세요 (1: CPU, 2: Memory)", choices=["1", "2"]
-    )
-    top_n_raw = Prompt.ask("상위 몇 개의 Pod를 볼까요?", default="20").strip()
+    sort_key = Prompt.ask("Select sort key (1: CPU, 2: Memory)", choices=["1", "2"])
+    top_n_raw = Prompt.ask("How many top pods to display?", default="20").strip()
     try:
         top_n = int(top_n_raw)
     except ValueError:
-        console.print("숫자가 아닙니다. 기본값 20을 적용합니다.", style="bold red")
+        console.print("Not a number. Using default: 20.", style="bold red")
         top_n = 20
     if top_n <= 0:
-        console.print(
-            "0 이하 값은 허용되지 않습니다. 20을 적용합니다.", style="bold red"
-        )
+        console.print("Value must be positive. Using default: 20.", style="bold red")
         top_n = 20
 
     filter_choice = (
-        Prompt.ask(
-            "특정 노드 라벨(key=value)로 필터링 하시겠습니까? (yes/no)", default="no"
-        )
+        Prompt.ask("Filter by node label (key=value)? (yes/no)", default="no")
         .strip()
         .lower()
     )
@@ -2819,23 +2868,24 @@ def watch_pod_resources() -> None:
         node_filter = _collect_nodes_for_selector(label_selection)
         if not node_filter:
             console.print(
-                f"선택한 라벨 {label_selection} 에 해당하는 노드가 없습니다.",
+                f"No nodes found for label {label_selection}.",
                 style="bold red",
             )
             return
 
-    console.print("\n(Ctrl+C로 중지 후 메뉴로 돌아갑니다.)", style="bold yellow")
+    console.print("\n(Press Ctrl+C to stop and return to menu.)", style="bold yellow")
 
     try:
         with suppress_terminal_echo():
             with Live(console=console, auto_refresh=False) as live:
-                tracker = LiveFrameTracker(live)
+                tracker = LiveFrameTracker(live, view_name="Pod Resource Usage")
                 while True:
+                    tracker.show_loading()
                     if label_selection and label_selection.expression:
                         node_filter = _collect_nodes_for_selector(label_selection)
                         if not node_filter:
                             console.print(
-                                "[bold red]라벨 필터에 해당하는 노드를 찾을 수 없습니다. 필터를 리셋합니다.[/bold red]"
+                                "[bold red]No nodes match the label filter. Resetting filter.[/bold red]"
                             )
                             label_selection = None
                             node_filter = None
@@ -2847,7 +2897,7 @@ def watch_pod_resources() -> None:
                             SnapshotPayload(
                                 title="Pod Resource Top - Error",
                                 status="error",
-                                body=f"kubectl top pod 호출에 실패했습니다:\n{error}",
+                                body=f"kubectl top pod failed:\n{error}",
                                 command=kubectl_cmd,
                             )
                         )
@@ -2856,8 +2906,8 @@ def watch_pod_resources() -> None:
                             _compose_group(
                                 kubectl_cmd,
                                 Panel(
-                                    f"kubectl top pod 호출에 실패했습니다:\n{error}",
-                                    title="오류",
+                                    f"kubectl top pod failed:\n{error}",
+                                    title="Error",
                                     style="bold red",
                                 ),
                             ),
@@ -2868,27 +2918,12 @@ def watch_pod_resources() -> None:
                         continue
 
                     if not metrics:
-                        frame_key = _make_frame_key("empty_metrics", "")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Resource Top - Empty",
-                                status="empty",
-                                body="표시할 Pod metrics가 없습니다.",
-                                command=kubectl_cmd,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                kubectl_cmd,
-                                Panel(
-                                    "표시할 Pod metrics가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            kubectl_cmd,
+                            "Pod Resource Usage",
+                            "No pod metrics to display.",
+                            suggestion="Ensure metrics-server is running in the cluster.",
                         )
                         tracker.tick()
                         continue
@@ -2913,27 +2948,12 @@ def watch_pod_resources() -> None:
                         )
 
                     if not enriched:
-                        frame_key = _make_frame_key("empty_filter", "")
-                        snapshot = _format_plain_snapshot(
-                            SnapshotPayload(
-                                title="Pod Resource Top - Filter Empty",
-                                status="empty",
-                                body="필터 조건에 해당하는 Pod가 없습니다.",
-                                command=kubectl_cmd,
-                            )
-                        )
-                        tracker.update(
-                            frame_key,
-                            _compose_group(
-                                kubectl_cmd,
-                                Panel(
-                                    "필터 조건에 해당하는 Pod가 없습니다.",
-                                    title="정보",
-                                    style="bold yellow",
-                                ),
-                            ),
-                            snapshot,
-                            input_state=CURRENT_INPUT_DISPLAY,
+                        _render_empty_state(
+                            tracker,
+                            kubectl_cmd,
+                            "Pod Resource Usage",
+                            "No pods match the filter criteria.",
+                            suggestion="Try broadening the node label filter.",
                         )
                         tracker.tick()
                         continue
@@ -2943,13 +2963,13 @@ def watch_pod_resources() -> None:
                             key=lambda item: cast(int, item["cpu_millicores"]),
                             reverse=True,
                         )
-                        subtitle = "정렬 기준: CPU(cores)"
+                        subtitle = "Sorted by: CPU(cores)"
                     else:
                         enriched.sort(
                             key=lambda item: cast(int, item["memory_bytes"]),
                             reverse=True,
                         )
-                        subtitle = "정렬 기준: Memory(bytes)"
+                        subtitle = "Sorted by: Memory(bytes)"
 
                     limited = enriched[:top_n]
                     header = Text(
@@ -3024,13 +3044,13 @@ def watch_pod_resources() -> None:
                     )
                     tracker.tick()
     except KeyboardInterrupt:
-        console.print("\n메뉴로 돌아갑니다...", style="bold yellow")
+        console.print("\nReturning to menu...", style="bold yellow")
 
 
 def main_menu() -> str:
-    """
-    메인 메뉴 출력
-    """
+    """메인 메뉴 출력."""
+    context = _get_current_context()
+
     menu_table = Table(
         show_header=False,
         box=box.ROUNDED,
@@ -3039,40 +3059,35 @@ def main_menu() -> str:
         title="Kubernetes Monitoring Tool",
         title_style="bold yellow",
         title_justify="center",
+        caption=f"Cluster: [bold cyan]{context}[/bold cyan]",
+        caption_justify="center",
     )
-    menu_table.add_column("Option")
+    menu_table.add_column("Option", width=6)
     menu_table.add_column("Description", style="white")
 
-    menu_options = [
-        ("1", "Event Monitoring (Normal, !=Normal)"),
-        ("2", "Container Monitoring (재시작된 컨테이너 및 로그)"),
-        ("3", "Pod Monitoring (생성된 순서) [옵션: Pod IP 및 Node Name 표시]"),
-        ("4", "Pod Monitoring (Running이 아닌 Pod) [옵션: Pod IP 및 Node Name 표시]"),
-        ("5", "Pod Monitoring (전체/정상/비정상 Pod 개수 출력)"),
-        (
-            "6",
-            "Pod Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]",
-        ),
-        (
-            "7",
-            "Node Monitoring (생성된 순서) [AZ, 선택 라벨 표시 및 필터링 가능]",
-        ),
-        (
-            "8",
-            "Node Monitoring (Unhealthy Node 확인) [AZ, 선택 라벨 표시 및 필터링 가능]",
-        ),
-        (
-            "9",
-            "Node Monitoring (CPU/Memory 사용량 높은 순 정렬) [노드 라벨 필터링 가능]",
-        ),
-        ("Q", "Quit"),
-    ]
+    # Events & Containers
+    menu_table.add_row("", "[bold cyan]Events & Containers[/bold cyan]")
+    menu_table.add_row("[bold green]1[/bold green]", "Event Monitoring")
+    menu_table.add_row("[bold green]2[/bold green]", "Container Restart Logs")
+    menu_table.add_row()
 
-    for option, description in menu_options:
-        if option == "Q":
-            menu_table.add_row(f"[bold yellow]{option}[/bold yellow]", description)
-        else:
-            menu_table.add_row(f"[bold green]{option}[/bold green]", description)
+    # Pods
+    menu_table.add_row("", "[bold green]Pods[/bold green]")
+    menu_table.add_row("[bold green]3[/bold green]", "Pod List (by creation)")
+    menu_table.add_row("[bold green]4[/bold green]", "Non-Running Pods")
+    menu_table.add_row("[bold green]5[/bold green]", "Pod Count Summary")
+    menu_table.add_row("[bold green]6[/bold green]", "Pod Resource Usage (CPU/Memory)")
+    menu_table.add_row()
+
+    # Nodes
+    menu_table.add_row("", "[bold blue]Nodes[/bold blue]")
+    menu_table.add_row("[bold green]7[/bold green]", "Node List (by creation)")
+    menu_table.add_row("[bold green]8[/bold green]", "Unhealthy Nodes")
+    menu_table.add_row("[bold green]9[/bold green]", "Node Resource Usage (CPU/Memory)")
+    menu_table.add_row()
+
+    menu_table.add_row("[bold yellow]Q[/bold yellow]", "Quit")
+
     console.print(menu_table)
     return Prompt.ask("Select an option")
 
@@ -3106,14 +3121,19 @@ def main() -> None:
             elif choice == "9":
                 watch_node_resources()
             elif choice.upper() == "Q":
-                _exit_with_cleanup(0, "정상 종료합니다.", style="bold green")
+                _exit_with_cleanup(0, "Exiting gracefully.", style="bold green")
             else:
-                print("잘못된 입력입니다. 메뉴에 표시된 숫자 또는 Q를 입력하세요.")
+                console.print(
+                    "Invalid input. Please enter a number (1-9) or Q.",
+                    style="bold yellow",
+                )
     except KeyboardInterrupt:
-        _exit_with_cleanup(130, "사용자 중단(Ctrl+C) 감지: 안전하게 종료합니다.")
+        _exit_with_cleanup(
+            130, "User interrupt (Ctrl+C) detected. Shutting down safely."
+        )
     except EOFError:
         _exit_with_cleanup(
-            0, "입력이 종료되었습니다(EOF). 정상 종료합니다.", style="bold green"
+            0, "Input terminated (EOF). Exiting gracefully.", style="bold green"
         )
 
 

@@ -40,7 +40,7 @@ def test_keyboard_interrupt_message_has_leading_blank_line(
     # 출력 캡처 및 검증: 반드시 공백 줄로 시작해야 함
     out = capsys.readouterr().out
     assert out.startswith("\n")
-    assert "사용자 중단(Ctrl+C) 감지: 안전하게 종료합니다." in out
+    assert "User interrupt (Ctrl+C) detected. Shutting down safely." in out
 
 
 @patch("kubernetes_monitoring.cleanup")
@@ -52,4 +52,4 @@ def test_eof_message_has_leading_blank_line(mock_exit, mock_cleanup, capsys):
 
     out = capsys.readouterr().out
     assert out.startswith("\n")
-    assert "입력이 종료되었습니다(EOF). 정상 종료합니다." in out
+    assert "Input terminated (EOF). Exiting gracefully." in out

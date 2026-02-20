@@ -598,7 +598,7 @@ def test_handle_snapshot_command_messages(
         cast(Live, invalid_live), mock_tracker, "invalid"
     )
     text_output = invalid_console.export_text()
-    assert "입력 'invalid' 은(는) 지원하지 않는 명령입니다." in text_output
+    assert "Command 'invalid' is not supported." in text_output
 
     # Success path message
     success_console = Console(record=True)
@@ -657,8 +657,8 @@ def test_handle_snapshot_command_messages(
         cast(Live, success_live), mock_tracker, ":save"
     )
     text_output = success_console.export_text()
-    assert "입력 ':save' 처리 성공" in text_output
-    assert "스냅샷 저장 완료" in text_output
+    assert "Command ':save' success" in text_output
+    assert "Snapshot saved" in text_output
     assert "(CSV:" in text_output
     assert captured_timestamps["markdown"] == captured_timestamps["csv"]
 
