@@ -2498,14 +2498,16 @@ def watch_node_monitoring_by_creation() -> None:
                     selected = _select_tail_sorted(
                         nodes,
                         tail_limit,
-                        key=lambda node: _ensure_datetime(
-                            getattr(
-                                getattr(node, "metadata", None),
-                                "creation_timestamp",
-                                None,
+                        key=lambda node: (
+                            _ensure_datetime(
+                                getattr(
+                                    getattr(node, "metadata", None),
+                                    "creation_timestamp",
+                                    None,
+                                )
                             )
-                        )
-                        or UTC_MIN,
+                            or UTC_MIN
+                        ),
                     )
 
                     table = Table(
@@ -2642,10 +2644,9 @@ def watch_unhealthy_nodes() -> None:
                     selected = _select_tail_sorted(
                         unhealthy,
                         tail_limit,
-                        key=lambda node: getattr(
-                            getattr(node, "metadata", None), "name", ""
-                        )
-                        or "",
+                        key=lambda node: (
+                            getattr(getattr(node, "metadata", None), "name", "") or ""
+                        ),
                     )
 
                     table = Table(
