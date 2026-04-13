@@ -19,7 +19,7 @@ kubernetes-monitoring = "kubernetes_monitoring:main"
 dev = [
     "pytest",
     "pytest-cov",
-    "ruff>=0.14.0",
+    "ruff>=0.15.10",
     "mypy",
 ]
 
