@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * Rename '재시작된 컨테이너 확인 및 로그 조회' menu to 'Container Monitoring (재시작된 컨테이너 및 로그)' for consistency.
 
+## [2.0.1](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v2.0.0...v2.0.1) (2026-08-16)
+
+
+### Documentation
+
+* add the MIT license ([8fac337](https://github.com/KKamJi98/kubernetes-monitoring-python/commit/8fac337be7145d9dad2a3c63484b9fbf8f958368))
+
 ## [2.0.0](https://github.com/KKamJi98/kubernetes-monitoring-python/compare/v1.5.0...v2.0.0) (2026-04-13)
 
 
