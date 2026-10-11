@@ -10,3 +10,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+
+  # Every action is pinned to a commit SHA, so nothing moves on its own. This
+  # entry is what keeps those pins current: one grouped PR a week.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

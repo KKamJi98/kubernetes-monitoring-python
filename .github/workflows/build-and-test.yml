@@ -8,13 +8,18 @@ on:
     branches:
       - main
 
+permissions: {}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.x'
       - name: Install uv
@@ -42,15 +47,41 @@ jobs:
           source .venv/bin/activate
           pytest --cov=./ --cov-report=xml
 
+  # release-please runs on a short-lived GitHub App installation token, not the
+  # default GITHUB_TOKEN. GitHub holds pull_request runs on a PR that
+  # GITHUB_TOKEN opened or updated (action_required, zero jobs) and expires them
+  # as failures after 30 days, so the release PR never got CI. Every write here
+  # goes through the App token, so GITHUB_TOKEN gets nothing. The token is
+  # scoped to this repository (no owner/repositories input) and to the two
+  # permissions release-please needs: contents for the release commit, tag and
+  # GitHub release, pull-requests for the release PR and its labels.
+  #
+  # Tags and releases made with the App token do start workflows. Nothing here
+  # listens for them today; a `push: tags` or `release` trigger added later will
+  # fire on every release.
+  #
+  # Only pushes to main reach this job. It used to run on every pull request as
+  # well, where it did nothing useful. With the App token that would break:
+  # Dependabot and fork PRs get no repository secrets, so the token step would
+  # fail and turn their CI red, and the release PR's own CI would re-run
+  # release-please against itself with a token whose writes start workflows.
   release-please:
     needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
+    timeout-minutes: 5
+    permissions: {}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
         with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
           release-type: python
           package-name: monitoring-kubernetes
